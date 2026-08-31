@@ -70,4 +70,12 @@ class BM25KeywordIndex(KeywordIndex):
             return []
         scores = self._bm25.get_scores(_tokenize(text))
         ranked = sorted(zip(self._order, scores), key=lambda x: x[1], reverse=True)
-        return [(self._chunks[cid], float(score)) for cid, score in ranked[:top_k] if score > 0]
+        # Do NOT filter by score > 0: with a very small corpus, BM25's IDF
+        # goes negative for terms that appear in most/all documents, which
+        # can push an otherwise-relevant chunk's score below zero. RRF
+        # fusion (application/retrieve.py) only consumes *rank*, never the
+        # raw score, so returning the full top_k regardless of sign is both
+        # safe and necessary — filtering here was silently discarding
+        # legitimate hits on small corpora. Mirrors NumpyVectorStore.query,
+        # which already returns top_k unconditionally.
+        return [(self._chunks[cid], float(score)) for cid, score in ranked[:top_k]]

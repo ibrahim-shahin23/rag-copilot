@@ -3,13 +3,18 @@ LLM provider adapters — completion leg of the provider abstraction.
 
 ExtractiveFallbackProvider needs no API key or network access, so it's what
 runs in this sandbox and in any environment where the free tier has run out
-(the spec explicitly asks you to design for that). AnthropicLLMProvider is
-the real hosted implementation; it is not exercised here for lack of a
-configured API key, but wiring it in is a one-line config change.
+(the spec explicitly asks you to design for that). GeminiLLMProvider is the
+real hosted implementation (Google's Gemini API); it is not exercised here
+for lack of a configured API key and because generativelanguage.googleapis.com
+isn't reachable from this sandbox's network policy — but wiring it in is a
+one-line config change (see infrastructure/config.py), which is exactly the
+point of the provider-abstraction requirement.
 """
 from __future__ import annotations
 
+import json
 import os
+import urllib.request
 
 from domain.ports import LLMProvider
 
@@ -36,14 +41,22 @@ class ExtractiveFallbackProvider(LLMProvider):
         )
 
 
-class AnthropicLLMProvider(LLMProvider):
-    def __init__(self, api_key: str | None = None, model: str = "claude-sonnet-4-6") -> None:
-        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+class GeminiLLMProvider(LLMProvider):
+    """Google Gemini adapter, called directly over REST (no SDK dependency,
+    consistent with HostedEmbeddingProvider's style) so this file stays
+    importable even in environments that never configure a Gemini key."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "gemini-1.5-flash",
+    ) -> None:
+        self._api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self._model = model
 
     @property
     def name(self) -> str:
-        return f"anthropic:{self._model}"
+        return f"gemini:{self._model}"
 
     def is_configured(self) -> bool:
         return bool(self._api_key)
@@ -51,17 +64,24 @@ class AnthropicLLMProvider(LLMProvider):
     def complete(self, system_prompt: str, user_prompt: str) -> str:
         if not self._api_key:
             raise RuntimeError(
-                "AnthropicLLMProvider requires ANTHROPIC_API_KEY; the "
-                "fallback chain should have routed to ExtractiveFallbackProvider."
+                "GeminiLLMProvider requires GEMINI_API_KEY; the fallback "
+                "chain should have routed to ExtractiveFallbackProvider."
             )
-        import anthropic  # local import: keeps this optional dependency out
-                            # of environments that only use the fallback
-
-        client = anthropic.Anthropic(api_key=self._api_key)
-        response = client.messages.create(
-            model=self._model,
-            max_tokens=1000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self._model}:generateContent?key={self._api_key}"
         )
-        return "".join(block.text for block in response.content if block.type == "text")
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"maxOutputTokens": 1000},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+        parts = body["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts)
