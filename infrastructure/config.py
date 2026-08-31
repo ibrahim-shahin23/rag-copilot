@@ -4,7 +4,7 @@ ports and concrete infrastructure adapters together, plus wire the
 documented fallback chain:
 
   Embeddings:  HostedEmbeddingProvider  -> (not configured / fails) -> TfidfEmbeddingProvider
-  Completion:  AnthropicLLMProvider     -> (not configured / fails) -> ExtractiveFallbackProvider
+  Completion:  GeminiLLMProvider        -> (not configured / fails) -> ExtractiveFallbackProvider
 
 Swapping the LLM provider, embedding model, or vector store is meant to be
 "configuration plus one adapter" per the spec's acceptance test — this file
@@ -19,7 +19,7 @@ from domain.ports import DocumentRepository, EmbeddingProvider, KeywordIndex, LL
 from infrastructure.embeddings.hosted_provider import HostedEmbeddingProvider
 from infrastructure.embeddings.tfidf_provider import TfidfEmbeddingProvider
 from infrastructure.keyword.bm25_index import BM25KeywordIndex
-from infrastructure.llm.providers import AnthropicLLMProvider, ExtractiveFallbackProvider
+from infrastructure.llm.providers import GeminiLLMProvider, ExtractiveFallbackProvider
 from infrastructure.relational.sqlite_repository import SqliteDocumentRepository
 from infrastructure.vectorstore.numpy_store import NumpyVectorStore
 
@@ -43,8 +43,8 @@ def build_wiring(data_dir: str = "data") -> Wiring:
         hosted_embedder if hosted_embedder.is_configured() else TfidfEmbeddingProvider()
     )
 
-    anthropic_llm = AnthropicLLMProvider()
-    llm: LLMProvider = anthropic_llm if anthropic_llm.is_configured() else ExtractiveFallbackProvider()
+    gemini_llm = GeminiLLMProvider()
+    llm: LLMProvider = gemini_llm if gemini_llm.is_configured() else ExtractiveFallbackProvider()
 
     return Wiring(
         repo=repo,
