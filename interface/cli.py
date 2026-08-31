@@ -12,7 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from application.ingest import IngestDocumentUseCase
 from application.retrieve import AnswerQueryUseCase
+from domain.errors import UnsupportedFormatError
 from infrastructure.config import build_wiring
+from infrastructure.extraction.text_extractor import extract_text
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
@@ -24,7 +26,11 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         keyword_index=wiring.keyword_index,
     )
     path = Path(args.file)
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = extract_text(path)
+    except UnsupportedFormatError as e:
+        print(f"error={e}")
+        return
     result = use_case.execute(source=path.name, doc_type=path.suffix.lstrip("."), raw_text=text)
     print(f"document_id={result.document_id}")
     print(f"status={result.status.value}")

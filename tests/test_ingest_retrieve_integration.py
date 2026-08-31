@@ -103,6 +103,55 @@ def test_out_of_corpus_question_is_refused(wiring):
     assert answer.citations == ()
 
 
+def test_cross_process_retrieval_uses_persisted_tfidf_vocabulary(tmp_data_dir):
+    """Regression test for the bug caught via the real CLI: `ingest` and
+    `ask` run as two separate OS processes, so a fresh TfidfEmbeddingProvider
+    instance (simulating the second process) must reuse the persisted,
+    already-fitted vectorizer rather than re-fitting on the query alone —
+    otherwise dense retrieval silently returns zero hits every time."""
+    persist_path = f"{tmp_data_dir}/tfidf.pkl"
+
+    # "Process 1": ingest.
+    repo1 = SqliteDocumentRepository(f"{tmp_data_dir}/copilot.db")
+    embedder1 = TfidfEmbeddingProvider(persist_path=persist_path)
+    vector_store = NumpyVectorStore(f"{tmp_data_dir}/vectors.pkl")
+    keyword_index = BM25KeywordIndex(f"{tmp_data_dir}/bm25.pkl")
+    ingest = IngestDocumentUseCase(repo1, embedder1, vector_store, keyword_index)
+    result = ingest.execute(source="spec.md", doc_type="md", raw_text=CORPUS)
+    assert result.status == IngestStatus.SUCCEEDED
+
+    # "Process 2": a brand-new provider instance, same persist path, same
+    # on-disk vector store — exactly what the CLI's `ask` invocation does.
+    embedder2 = TfidfEmbeddingProvider(persist_path=persist_path)
+    vector_store2 = NumpyVectorStore(f"{tmp_data_dir}/vectors.pkl")
+    keyword_index2 = BM25KeywordIndex(f"{tmp_data_dir}/bm25.pkl")
+    answer_uc = AnswerQueryUseCase(
+        embedder=embedder2, vector_store=vector_store2, keyword_index=keyword_index2,
+        llm=ExtractiveFallbackProvider(), config=RetrievalConfig(refusal_threshold=0.001),
+    )
+    answer = answer_uc.execute("What does FR-2 require about citations?")
+    assert not answer.refused
+    assert len(answer.citations) > 0
+
+
+def test_small_corpus_keyword_match_is_not_dropped_by_negative_bm25_idf(wiring):
+    """Regression test: with very few documents, BM25's IDF for a common
+    term can go negative, and a naive `score > 0` filter used to drop an
+    otherwise-relevant hit entirely. Two short chunks sharing a term is
+    exactly that edge case."""
+    repo, embedder, vector_store, keyword_index, llm = wiring
+    ingest = IngestDocumentUseCase(repo, embedder, vector_store, keyword_index)
+    tiny_corpus = (
+        "FR-1 Ingestion. Support at least two input formats.\n\n"
+        "FR-2 Retrieval. Hybrid retrieval with citations is mandatory."
+    )
+    ingest.execute(source="tiny.md", doc_type="md", raw_text=tiny_corpus)
+
+    hits = keyword_index.query("FR-2 citations", top_k=5)
+    assert len(hits) > 0
+    assert any("FR-2" in (c.metadata.section or "") for c, _ in hits)
+
+
 def test_indirect_prompt_injection_in_ingested_content_does_not_leak_system_prompt(wiring):
     """OWASP LLM Top 10: indirect injection via retrieved content. The
     injected instruction lives inside a *chunk*, not the system prompt, and

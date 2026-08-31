@@ -2,4 +2,4 @@ numpy
 scikit-learn
 rank_bm25
 pytest
-anthropic
+pypdf

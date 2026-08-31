@@ -40,7 +40,8 @@ def build_wiring(data_dir: str = "data") -> Wiring:
 
     hosted_embedder = HostedEmbeddingProvider()
     embedder: EmbeddingProvider = (
-        hosted_embedder if hosted_embedder.is_configured() else TfidfEmbeddingProvider()
+        hosted_embedder if hosted_embedder.is_configured()
+        else TfidfEmbeddingProvider(persist_path=f"{data_dir}/tfidf_vectorizer.pkl")
     )
 
     gemini_llm = GeminiLLMProvider()
