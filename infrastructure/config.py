@@ -3,8 +3,14 @@ Composition root. This is the ONLY file that should import both domain
 ports and concrete infrastructure adapters together, plus wire the
 documented fallback chain:
 
-  Embeddings:  HostedEmbeddingProvider  -> (fails at call time, any reason) -> TfidfEmbeddingProvider
+  Embeddings:  GeminiEmbeddingProvider  -> (fails at call time, any reason) -> TfidfEmbeddingProvider
   Completion:  GeminiLLMProvider        -> (fails at call time, any reason) -> ExtractiveFallbackProvider
+
+Embeddings default to Gemini's free-tier `gemini-embedding-001` rather than
+OpenAI's paid endpoint (infrastructure/embeddings/hosted_provider.py is
+still there as an alternative, just not wired by default) — both provider
+and completion now run off the same free GEMINI_API_KEY, no paid key
+needed at all for the default configuration.
 
 Both chains are resolved per-call via FallbackEmbeddingProvider /
 FallbackLLMProvider (infrastructure/resilience/), not once at startup —
@@ -31,7 +37,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from domain.ports import DocumentRepository, EmbeddingProvider, KeywordIndex, LLMProvider, VectorStore
-from infrastructure.embeddings.hosted_provider import HostedEmbeddingProvider
+from infrastructure.embeddings.gemini_embedding_provider import GeminiEmbeddingProvider
 from infrastructure.embeddings.tfidf_provider import TfidfEmbeddingProvider
 from infrastructure.keyword.bm25_index import BM25KeywordIndex
 from infrastructure.llm.providers import GeminiLLMProvider, ExtractiveFallbackProvider
@@ -62,7 +68,7 @@ def build_wiring(data_dir: str = "data") -> Wiring:
     # and still fail per-call (quota, rate limit, network) — that must
     # degrade gracefully, not crash. See infrastructure/resilience/.
     embedder: EmbeddingProvider = FallbackEmbeddingProvider(
-        primary=HostedEmbeddingProvider(),
+        primary=GeminiEmbeddingProvider(),
         secondary=TfidfEmbeddingProvider(persist_path=f"{data_dir}/tfidf_vectorizer.pkl"),
     )
 

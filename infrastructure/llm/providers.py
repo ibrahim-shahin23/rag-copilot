@@ -43,13 +43,23 @@ class ExtractiveFallbackProvider(LLMProvider):
 
 class GeminiLLMProvider(LLMProvider):
     """Google Gemini adapter, called directly over REST (no SDK dependency,
-    consistent with HostedEmbeddingProvider's style) so this file stays
-    importable even in environments that never configure a Gemini key."""
+    consistent with the embedding adapters) so this file stays importable
+    even in environments that never configure a Gemini key.
+
+    Model default: `gemini-flash-latest`, not a pinned version. Gemini 1.5
+    models are fully shut down as of 2026 — every call to them now returns
+    HTTP 404, which is exactly the failure this project hit in testing.
+    `gemini-flash-latest` is a Google-maintained alias that always points
+    at the current recommended flash model, which is the right way to
+    avoid re-hitting this same class of bug when the next model rotation
+    happens. Pin an explicit version instead if you need reproducible
+    outputs across model updates.
+    """
 
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gemini-1.5-flash",
+        model: str = "gemini-flash-latest",
     ) -> None:
         self._api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self._model = model
@@ -64,12 +74,15 @@ class GeminiLLMProvider(LLMProvider):
     def complete(self, system_prompt: str, user_prompt: str) -> str:
         if not self._api_key:
             raise RuntimeError(
-                "GeminiLLMProvider requires GEMINI_API_KEY; the fallback "
-                "chain should have routed to ExtractiveFallbackProvider."
+                "GeminiLLMProvider requires GEMINI_API_KEY. This is "
+                "expected to be caught by FallbackLLMProvider "
+                "(infrastructure/resilience/) and degrade to the "
+                "extractive fallback — see build_wiring() in "
+                "infrastructure/config.py."
             )
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self._model}:generateContent?key={self._api_key}"
+            f"{self._model}:generateContent"
         )
         payload = {
             "systemInstruction": {"parts": [{"text": system_prompt}]},
@@ -79,7 +92,10 @@ class GeminiLLMProvider(LLMProvider):
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self._api_key,
+            },
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = json.loads(resp.read())

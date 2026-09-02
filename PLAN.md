@@ -42,8 +42,8 @@ code review discipline.
 | Web framework | FastAPI | OpenAPI generation for free (FR-7), native async for streaming (FR-6) |
 | Relational store | Postgres (SQLite adapter ✅ built first as the cheapest thing that proves the port) | Row-level security fits the multi-tenancy isolation requirement directly |
 | Vector store | pgvector to start (numpy adapter ✅ built as the MVP swap-in); Qdrant if scale demands a dedicated index | One fewer moving service for a capstone-scale deployment; same Postgres instance can enforce tenant isolation at the DB layer |
-| Embeddings | Hosted API (OpenAI or Anthropic-compatible) with local TF-IDF/sentence-transformer fallback ✅ | Provider abstraction requirement; demonstrated fallback chain |
-| LLM | Anthropic Claude (primary), extractive fallback ✅ for degraded mode | Matches team's existing Anthropic API experience |
+| Embeddings | Gemini's free-tier hosted API (`gemini-embedding-001`) with local TF-IDF fallback ✅ | Free-tier friendly, same key as the LLM; provider abstraction still swaps to OpenAI/other in one adapter |
+| LLM | Google Gemini (primary), extractive fallback ✅ for degraded mode | Free-tier friendly |
 | Orchestration pattern | **Supervisor** (see §4) | Named, justified below |
 | Agent contracts | Pydantic models (typed, not free-form text) | FR-4 requires typed I/O between agents |
 | Streaming | SSE (not WebSocket) | Simpler client story for a single-direction token stream + progress events; no need for bidirectional |
