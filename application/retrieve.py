@@ -92,13 +92,23 @@ class AnswerQueryUseCase:
         ranked = sorted(chunks_by_id.values(), key=lambda c: scores[c.id], reverse=True)
         return [(c, scores[c.id]) for c in ranked[: cfg.fused_top_k]]
 
-    def execute(self, query: str) -> Answer:
+    def retrieve(self, query: str) -> list[tuple[Chunk, float]]:
+        """Hybrid retrieval + fusion, exposed separately from execute() so
+        callers (notably the FR-3 evaluation harness, eval/harness.py) can
+        measure retrieval quality — did the right chunk get retrieved at
+        all? — independently of whether the refusal threshold then chose
+        to answer. Conflating the two would make it impossible to tell
+        "retrieval failed" apart from "retrieval succeeded but we correctly
+        declined," which are very different failure modes to score."""
         cfg = self._cfg
         [query_vector] = self._embedder.embed([query])
-
         dense_hits = self._vector_store.query(query_vector, top_k=cfg.dense_top_k)
         keyword_hits = self._keyword_index.query(query, top_k=cfg.keyword_top_k)
-        fused = self._fuse(query, dense_hits, keyword_hits)
+        return self._fuse(query, dense_hits, keyword_hits)
+
+    def execute(self, query: str) -> Answer:
+        cfg = self._cfg
+        fused = self.retrieve(query)
 
         if not fused or fused[0][1] < cfg.refusal_threshold:
             return Answer(

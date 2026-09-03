@@ -1,11 +1,12 @@
-# RAG Copilot — Ingestion & Hybrid Retrieval Slice
+# RAG Copilot — Ingestion, Hybrid Retrieval & Evaluation
 
-One fully-implemented feature out of the full capstone spec: **FR-1
-(ingestion) + FR-2 (hybrid retrieval with citations and refusal)**, built
-with Clean Architecture as the foundation the rest of the system (agents,
-API surface, security controls) will sit on top of. See `PLAN.md` at the
-repo root (one level up) for how this slice fits the full spec and what's
-still to build.
+Two fully-implemented pieces of the full capstone spec: **FR-1 (ingestion)
++ FR-2 (hybrid retrieval with citations and refusal)**, and **FR-3
+(evaluation harness with a real golden set and recorded baseline
+numbers)**, built with Clean Architecture as the foundation the rest of
+the system (agents, API surface, security controls) will sit on top of.
+See `PLAN.md` at the repo root (one level up) for how this fits the full
+spec and what's still to build.
 
 ## Architecture
 
@@ -14,8 +15,9 @@ domain/           entities.py, ports.py, errors.py
                   Zero imports from infrastructure/, no LLM/vector-store/web-framework SDKs.
 application/      chunking.py, ingest.py, retrieve.py
                   Use cases + chunking strategy. Depends only on domain/ ports.
-infrastructure/   embeddings/ (tfidf + hosted-stub), vectorstore/ (numpy),
-                  keyword/ (bm25), relational/ (sqlite), llm/ (extractive + gemini), config.py
+infrastructure/   embeddings/ (tfidf + gemini + hosted-openai), vectorstore/ (numpy),
+                  keyword/ (bm25), relational/ (sqlite), llm/ (extractive + gemini),
+                  extraction/ (pdf/text), resilience/ (call-time fallback), config.py
                   Concrete adapters implementing domain/ports.py. config.py is the
                   composition root — the only file that wires domain to infrastructure.
 interface/        cli.py — thin, imports use cases + config only.
@@ -149,6 +151,37 @@ python interface/cli.py ask "What does FR-2 say about citations?"
   The test suite demonstrates correct refusal by setting an explicit,
   strict threshold for that case, rather than pretending the default
   constant is production-ready.
+
+## Evaluation (FR-3)
+
+```bash
+python eval/harness.py
+```
+
+Runs fully offline (TF-IDF + BM25 + extractive fallback — no API key
+needed, deterministic, safe for CI on every PR) against 31 golden Q/A
+pairs (`eval/golden_set.json`: 25 standard + 6 adversarial, covering all
+four required adversarial categories). Writes `eval/results/report.md`
+(human-readable, with a hand-written Interpretation section) and
+`eval/results/report.json` (machine-readable).
+
+**Actual first-run baseline** — see `eval/results/report.md` for full
+detail and interpretation, `docs/ADR-003-evaluation-methodology.md` for
+why the harness is built this way:
+
+| metric | overall | standard | worst finding |
+|---|---|---|---|
+| retrieval hit-rate | 96.3% | 100% | ambiguous-term item: 0% |
+| groundedness | 78% | 78% | 6/25 items missed the exact chunk |
+| refusal correctness | 93.1% | 100% | out-of-corpus: 0/2 |
+| injection leak-free | 100% | — | 2/2 |
+
+The two real failures are kept as documented findings, not tuned away — a
+refusal-threshold sweep found no value that fixes out-of-corpus refusal
+without collapsing standard-question accuracy, meaning the actual fix is
+an absolute similarity signal (real embeddings or a re-ranker), not a
+better constant. See the report's Interpretation section for the full
+threshold-sweep data and root-cause analysis.
 
 ## Explicitly out of scope for this slice
 Multi-agent orchestration (FR-4/5), streaming (FR-6), the full HTTP API/UI
