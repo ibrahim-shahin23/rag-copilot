@@ -56,7 +56,7 @@ code review discipline.
 |---|---|---|
 | FR-1 Ingestion | `application/ingest.py` + adapters | ✅ built |
 | FR-2 Retrieval | `application/retrieve.py` + ADR-001/002 | ✅ built |
-| FR-3 Evaluation | golden set + harness (`eval/`) | Not built — next priority |
+| FR-3 Evaluation | golden set + harness (`eval/`) | ✅ built |
 | FR-4 Multi-agent | Standards Mapper, Curriculum Designer, Item Generator + orchestrator | Not built |
 | FR-5 Orchestration | Supervisor pattern, approval gate, run inspector | Not built |
 | FR-6 Real-time | SSE endpoint, cancellation token propagated to agent loop | Not built |
@@ -117,21 +117,35 @@ and validation-pass result; approve / reject / edit-and-approve, all
 audited with correlation ID (FR-9) tying the decision back to the run that
 produced it.
 
-## 5. Evaluation harness (FR-3) — next build priority
+## 5. Evaluation harness (FR-3) — ✅ built
 
-25+ Q/A pairs against the real corpus once assembled, ≥5 adversarial:
-out-of-corpus (✅ pattern demonstrated in the built slice's integration
-test), ambiguous (a question matching two conflicting source chunks),
-prompt injection (✅ pattern demonstrated — indirect injection via an
-ingested document), conflicting sources (two ingested versions of the same
-policy disagreeing). Harness reports retrieval hit-rate (did the correct
-chunk appear in the fused top-k?), groundedness (does every claim in the
-answer trace to a citation?), and refusal correctness (did the system
-refuse exactly the questions it should have) — and the plan is to publish
-the actual first-run numbers, including the bad ones, the same way ADR-002
-already documents the refusal-threshold calibration problem found while
-building FR-2, rather than tuning until numbers look good and calling that
-the baseline.
+`eval/harness.py` runs 31 golden Q/A pairs (25 standard + 6 adversarial,
+exceeding both the ≥25 and ≥5 minimums) against the real pipeline, fully
+offline and deterministic (see ADR-003). All four required adversarial
+categories are covered: out-of-corpus (2 items), ambiguous (1), prompt
+injection (2), conflicting sources (1).
+
+**Actual baseline, first real run** (`eval/results/report.md` has the full
+per-item breakdown and interpretation):
+
+| metric | overall | standard | worst category |
+|---|---|---|---|
+| retrieval hit-rate | 96.3% | 100% | ambiguous: 0% (1 item) |
+| groundedness | 78% | 78% | — |
+| refusal correctness | 93.1% | 100% | out-of-corpus: 0% (2 items) |
+| injection leak-free | 100% | — | prompt-injection: 100% |
+
+The two real failures — out-of-corpus questions being answered instead of
+refused, and groundedness sitting at 78% rather than ~100% — are kept as
+documented findings, not tuned away: a refusal-threshold sweep (0.012 to
+0.05) found no value that fixes out-of-corpus refusal without collapsing
+standard-question refusal-correctness to 40%, which means the real fix is
+an absolute similarity signal (a real embedding model, or a re-ranker),
+not a better constant. The groundedness gap traces to the same root cause
+— `spec.md`'s 12 chunks competing with each other under TF-IDF's weak
+lexical matching — and is expected to close substantially once a real
+embedding model replaces the offline TF-IDF fallback. Both are tracked in
+§8's roadmap rather than being called "done."
 
 ## 6. Security (FR-5 §5 requirements, planned control set)
 
@@ -163,10 +177,9 @@ assert zero rows returned.
 ## 8. Roadmap / milestones
 
 1. ✅ **Ingestion + hybrid retrieval + citations** (this repo, done)
-2. Evaluation harness + golden set (next — needed before agent work can be
-   scored meaningfully)
+2. ✅ **Evaluation harness + golden set** (this repo, done — see §5 above)
 3. Multi-agent pipeline (Standards Mapper → Curriculum Designer → Item
-   Generator) + supervisor + approval gate
+   Generator) + supervisor + approval gate — next priority
 4. Streaming + cancellation
 5. FastAPI surface + OpenAPI + minimal UI + auth/roles
 6. Multi-tenancy + Postgres migration off SQLite/numpy MVP adapters
