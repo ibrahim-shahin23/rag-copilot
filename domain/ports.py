@@ -78,6 +78,13 @@ class DocumentRepository(ABC):
     def delete_chunks_for_document(self, document_id: str) -> None:
         ...
 
+    @abstractmethod
+    def find_chunk_by_id(self, chunk_id: str) -> Chunk | None:
+        """Canonical chunk lookup by id — used by the FR-3/FR-4 validation
+        passes to verify a claim against the *current* stored chunk text,
+        rather than trusting a copy an agent may have cached earlier."""
+        ...
+
 
 class LLMProvider(ABC):
     """Chat/completion provider used to synthesize a grounded answer."""

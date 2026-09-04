@@ -37,11 +37,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from domain.ports import DocumentRepository, EmbeddingProvider, KeywordIndex, LLMProvider, VectorStore
+from domain.workflow_ports import ApprovalGateRepository, RunRepository
 from infrastructure.embeddings.gemini_embedding_provider import GeminiEmbeddingProvider
 from infrastructure.embeddings.tfidf_provider import TfidfEmbeddingProvider
 from infrastructure.keyword.bm25_index import BM25KeywordIndex
 from infrastructure.llm.providers import GeminiLLMProvider, ExtractiveFallbackProvider
 from infrastructure.relational.sqlite_repository import SqliteDocumentRepository
+from infrastructure.relational.workflow_repository import SqliteWorkflowRepository
 from infrastructure.resilience.fallback_providers import FallbackEmbeddingProvider, FallbackLLMProvider
 from infrastructure.vectorstore.numpy_store import NumpyVectorStore
 
@@ -56,12 +58,14 @@ class Wiring:
     vector_store: VectorStore
     keyword_index: KeywordIndex
     llm: LLMProvider
+    workflow_repo: RunRepository  # also implements ApprovalGateRepository
 
 
 def build_wiring(data_dir: str = "data") -> Wiring:
     repo = SqliteDocumentRepository(f"{data_dir}/copilot.db")
     vector_store = NumpyVectorStore(f"{data_dir}/vectors.pkl")
     keyword_index = BM25KeywordIndex(f"{data_dir}/bm25.pkl")
+    workflow_repo = SqliteWorkflowRepository(f"{data_dir}/copilot.db")
 
     # Wrapped in a runtime fallback rather than chosen once via
     # is_configured(): a hosted provider can be configured (key present)
@@ -83,4 +87,38 @@ def build_wiring(data_dir: str = "data") -> Wiring:
         vector_store=vector_store,
         keyword_index=keyword_index,
         llm=llm,
+        workflow_repo=workflow_repo,
+    )
+
+
+def build_supervisor(wiring: Wiring):
+    """Assembles the FR-4/FR-5 multi-agent pipeline from an existing
+    Wiring. Kept in the composition root, not in interface/cli.py, so the
+    CLI stays a thin presentation layer — it only ever imports use cases
+    and this function, never infrastructure adapters directly."""
+    from application.agents.curriculum_designer import CurriculumDesignerAgent
+    from application.agents.item_generator import ItemGeneratorAgent
+    from application.agents.standards_mapper import StandardsMapperAgent
+    from application.orchestration.supervisor import Supervisor
+    from application.retrieve import AnswerQueryUseCase
+    from application.tools import AssessCompetencyMatchTool, DraftItemTool, ReadPriorCurriculaTool, SearchCorpusTool, SubmitForApprovalTool
+
+    answer_uc = AnswerQueryUseCase(
+        embedder=wiring.embedder, vector_store=wiring.vector_store,
+        keyword_index=wiring.keyword_index, llm=wiring.llm,
+    )
+    search_corpus = SearchCorpusTool(answer_uc)
+    assess_competency_match = AssessCompetencyMatchTool(answer_uc)
+    read_prior_curricula = ReadPriorCurriculaTool(answer_uc)
+    draft_item = DraftItemTool(llm=wiring.llm)
+    submit_for_approval = SubmitForApprovalTool(wiring.workflow_repo)
+
+    return Supervisor(
+        standards_mapper=StandardsMapperAgent(assess_competency_match),
+        curriculum_designer=CurriculumDesignerAgent(search_corpus, read_prior_curricula),
+        item_generator=ItemGeneratorAgent(search_corpus, draft_item),
+        submit_for_approval=submit_for_approval,
+        run_repo=wiring.workflow_repo,
+        document_repo=wiring.repo,
+        fallback_answer_uc=answer_uc,
     )

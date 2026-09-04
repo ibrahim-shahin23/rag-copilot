@@ -34,6 +34,17 @@ vector store is configuration plus one new adapter file. `domain/` and
 CI should eventually enforce this with an import-linter rule, not just
 code review discipline.
 
+**ADR status** (spec requires ≥4, covering chunking/retrieval,
+orchestration pattern, vector store choice, and the twist's central
+decision): ADR-001 (chunking) ✅, ADR-002 (retrieval fusion) ✅, ADR-003
+(evaluation methodology — bonus, not one of the four required topics) ✅,
+ADR-004 (orchestration pattern) ✅. Still missing: a dedicated vector store
+choice ADR (the numpy MVP vs. pgvector/Qdrant tradeoff is described in §2's
+stack table but not yet formalized as its own ADR) and a twist's-central-
+decision ADR (the education vertical's agent design is documented in §4
+but, similarly, not yet its own ADR). Tracked here rather than silently
+assumed done.
+
 ## 2. Stack
 
 | Concern | Choice | Why |
@@ -57,8 +68,8 @@ code review discipline.
 | FR-1 Ingestion | `application/ingest.py` + adapters | ✅ built |
 | FR-2 Retrieval | `application/retrieve.py` + ADR-001/002 | ✅ built |
 | FR-3 Evaluation | golden set + harness (`eval/`) | ✅ built |
-| FR-4 Multi-agent | Standards Mapper, Curriculum Designer, Item Generator + orchestrator | Not built |
-| FR-5 Orchestration | Supervisor pattern, approval gate, run inspector | Not built |
+| FR-4 Multi-agent | Standards Mapper, Curriculum Designer, Item Generator + orchestrator | ✅ built |
+| FR-5 Orchestration | Supervisor pattern, approval gate, run inspector | ✅ built |
 | FR-6 Real-time | SSE endpoint, cancellation token propagated to agent loop | Not built |
 | FR-7 Surface | FastAPI + OpenAPI + minimal UI | Not built |
 | FR-8 Access | Auth (JWT) + instructor/reviewer vs. contributor roles | Not built |
@@ -67,55 +78,80 @@ code review discipline.
 | Security (§5) | `docs/SECURITY.md` control-to-threat mapping | Not built |
 | Engineering process (§6) | Git/PR/CI discipline | Applies from commit 1 |
 
-## 4. Multi-agent design (education vertical)
+## 4. Multi-agent design (education vertical) — ✅ built
 
 **Agents** (each: explicit role, restricted tool set, defined I/O, termination condition):
 
-1. **Standards Mapper** — input: target role + raw competency framework
-   text (from the ingested corpus). Output: a typed `CompetencyGapReport`
-   (list of gaps, each cited back to the source standard via FR-2's
-   citation mechanism). Tools: `search_corpus` (read-only, wraps
-   `AnswerQueryUseCase`). Terminates when every named competency in the
-   target role has either a matched standard or an explicit "unmapped" flag
-   — never silently drops one.
-2. **Curriculum Designer** — input: `CompetencyGapReport`. Output: a typed
-   `ModuleOutline` (ordered modules, each tied to one or more gaps). Tools:
-   `search_corpus`, `read_prior_curricula` (read-only). Terminates on a
-   complete outline covering every gap, or an explicit "needs human input"
-   result if gaps can't be reconciled into a coherent sequence.
-3. **Item Generator** — input: one `ModuleOutline` module at a time.
-   Output: typed `AssessmentItem[]` (question, options, answer key,
-   citation back to source material). Tools: `search_corpus`,
-   `draft_item` (pure generation, no side effects), and the one
-   write/side-effecting tool: `submit_for_approval` (writes to the
-   approval-gate queue — **never executed without passing the gate**, per
-   FR-4). Terminates per-module when item count reaches the configured
-   target or the module's source material is exhausted.
+1. **Standards Mapper** (`application/agents/standards_mapper.py`) —
+   input: target role + a caller-supplied list of competencies (role→
+   competency taxonomies are a real product surface on their own; out of
+   scope for this slice). Output: a typed `CompetencyGapReport`. Tool:
+   `AssessCompetencyMatchTool` only (read-only) — **not** the originally
+   planned `search_corpus`; see the note below on why that changed.
+   Terminates when every named competency has either a matched standard
+   (with citation) or an explicit "unmapped" flag — enforced structurally
+   by a single loop over the input list, not a convention to remember.
+2. **Curriculum Designer** (`application/agents/curriculum_designer.py`)
+   — input: `CompetencyGapReport`. Output: a typed `ModuleOutline`. Tools:
+   `search_corpus`, `read_prior_curricula` (both read-only). Terminates on
+   a module per matched gap, or an explicit `needs_human_input=True`
+   result if zero gaps matched.
+3. **Item Generator** (`application/agents/item_generator.py`) — input:
+   one `Module` at a time. Output: typed `list[AssessmentItem]`. Tools:
+   `search_corpus`, `draft_item` (pure generation — LLM-first with a
+   deterministic numeric-masking fallback for the offline case, see
+   `application/tools.py`). Does **not** hold `submit_for_approval` —
+   the orchestrator calls that after validation, so even a misbehaving
+   agent has no path to the one write-capable tool. Terminates at the
+   configured item-count target or when the module's retrievable source
+   material runs out; an un-draftable chunk is skipped, never forced into
+   a bad item.
 
-**Orchestrator**: supervisor pattern (named, per FR-5) — a single
-supervisor agent sequences Standards Mapper → Curriculum Designer → Item
-Generator, inspects each agent's typed output before advancing, and owns
-the mandatory controls: max-iteration breaker per agent, per-step timeout,
-retry-with-backoff on transient tool failures, and graceful degradation to
-plain RAG (skip straight to `AnswerQueryUseCase` against the corpus) if any
-agent in the chain fails its termination condition after retries.
-Supervisor over planner-executor: the pipeline here is a fixed, known
-sequence (map → design → generate), not a plan that needs to be discovered
-per-request, so a supervisor's simpler control flow is a better fit than a
-general planner.
+**Real bug found and fixed during implementation**: Standards Mapper
+originally used `search_corpus` (raw `AnswerQueryUseCase.retrieve()`),
+which has no relevance threshold by design — so a nonsense competency
+like "quantum telepathy" still "matched" a chunk, and the "unmapped" path
+could never actually trigger. Caught in live CLI testing, not simulated.
+Fixed with `AssessCompetencyMatchTool`, built on
+`AnswerQueryUseCase.execute()`'s refusal decision instead — the one
+relevance signal the rest of the system has actually been evaluated
+against (FR-3's `eval/results/report.md`). This *inherits* rather than
+fixes FR-3's already-documented threshold-calibration limitation
+(ADR-002) — re-testing "quantum telepathy" after the fix still matches
+incorrectly, for the same root cause out-of-corpus refusal fails 2/2 in
+the eval report. Full writeup: `docs/ADR-004-orchestration-pattern.md`.
 
-**Automated validation pass** (the "plausible-but-wrong items" requirement):
-a fourth, non-generative step — deterministic checks (does the marked
-correct answer actually appear verbatim in the cited source chunk? are
-distractors non-duplicate? is the citation chunk-id real?) plus one LLM-as-
-judge pass scoring groundedness before an item reaches the approval gate.
-This is validation, not a fourth "specialised agent" in the FR-4 sense —
-it's a quality gate the orchestrator runs, not a role with its own tool set.
+**Orchestrator**: supervisor pattern (`application/orchestration/supervisor.py`)
+— sequences Standards Mapper → Curriculum Designer → Item Generator,
+inspects each agent's typed output before advancing, and owns the
+mandatory controls (all real mechanisms, tested, not just documented —
+see ADR-004): max-iteration breaker, per-step timeout (thread-pool
+`future.result(timeout=...)`), retry-with-backoff, and graceful
+degradation to plain RAG. A second real bug was caught here too: an
+earlier version's `with ThreadPoolExecutor() as executor:` silently
+blocked on `__exit__` until a timed-out call finished anyway, defeating
+the timeout — found by a test that measured actual wall-clock time
+end-to-end, fixed with explicit `executor.shutdown(wait=False)`.
 
-**Approval gate**: instructor sees each `AssessmentItem` with its citation
-and validation-pass result; approve / reject / edit-and-approve, all
-audited with correlation ID (FR-9) tying the decision back to the run that
-produced it.
+**Automated validation pass** (`application/validation.py`) — the
+"plausible-but-wrong items" requirement. Deterministic checks only (no
+LLM-as-judge pass, to keep it as fast/free/deterministic as the rest of
+the offline-testable stack): the correct option must appear verbatim in
+the *canonically re-fetched* cited chunk (`DocumentRepository.find_chunk_by_id`,
+never a possibly-stale local copy), options must be non-duplicate, and
+the citation must resolve to a real stored chunk at all. Not a fourth
+"specialised agent" in the FR-4 sense — no tool set, no role, just a
+quality gate the orchestrator runs between generation and submission.
+**Every** item is submitted regardless of validation outcome — a failed
+item is flagged (`validation_passed=False`, `validation_notes`
+explaining why) and still reaches a human reviewer, rather than being
+silently dropped, which would turn "catch and flag" into "catch and hide."
+
+**Approval gate**: `SqliteWorkflowRepository` implements
+`ApprovalGateRepository`; `python cli.py approvals-list` /
+`approvals-decide <id> approve|reject|edit` cover all three required
+decisions, each audited with `decided_by` + `decided_at`
+(`edited_and_approved` is the only path that populates `approved_text`).
 
 ## 5. Evaluation harness (FR-3) — ✅ built
 
@@ -178,9 +214,10 @@ assert zero rows returned.
 
 1. ✅ **Ingestion + hybrid retrieval + citations** (this repo, done)
 2. ✅ **Evaluation harness + golden set** (this repo, done — see §5 above)
-3. Multi-agent pipeline (Standards Mapper → Curriculum Designer → Item
-   Generator) + supervisor + approval gate — next priority
-4. Streaming + cancellation
+3. ✅ **Multi-agent pipeline** (Standards Mapper → Curriculum Designer →
+   Item Generator) + supervisor + approval gate (this repo, done — see §4
+   above)
+4. Streaming + cancellation — next priority
 5. FastAPI surface + OpenAPI + minimal UI + auth/roles
 6. Multi-tenancy + Postgres migration off SQLite/numpy MVP adapters
 7. Observability (correlation IDs, cost ledger, tracing) + SECURITY.md

@@ -126,6 +126,24 @@ class SqliteDocumentRepository(DocumentRepository):
         self._conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
         self._conn.commit()
 
+    def find_chunk_by_id(self, chunk_id: str) -> Chunk | None:
+        row = self._conn.execute(
+            "SELECT id, document_id, text, source, section, position, "
+            "char_start, char_end, version FROM chunks WHERE id = ?",
+            (chunk_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Chunk(
+            id=row[0],
+            document_id=row[1],
+            text=row[2],
+            metadata=ChunkMetadata(
+                source=row[3], section=row[4], position=row[5],
+                char_start=row[6], char_end=row[7], version=row[8],
+            ),
+        )
+
     def chunk_count_for_document(self, document_id: str) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) FROM chunks WHERE document_id = ?", (document_id,)
