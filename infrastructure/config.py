@@ -41,7 +41,7 @@ from domain.workflow_ports import ApprovalGateRepository, RunRepository
 from infrastructure.embeddings.gemini_embedding_provider import GeminiEmbeddingProvider
 from infrastructure.embeddings.tfidf_provider import TfidfEmbeddingProvider
 from infrastructure.keyword.bm25_index import BM25KeywordIndex
-from infrastructure.llm.providers import GeminiLLMProvider, ExtractiveFallbackProvider
+from infrastructure.llm.providers import GeminiLLMProvider, GemmaLocalLLMProvider, ExtractiveFallbackProvider
 from infrastructure.relational.sqlite_repository import SqliteDocumentRepository
 from infrastructure.relational.workflow_repository import SqliteWorkflowRepository
 from infrastructure.resilience.fallback_providers import FallbackEmbeddingProvider, FallbackStreamingLLMProvider
@@ -79,7 +79,10 @@ def build_wiring(data_dir: str = "data") -> Wiring:
 
     llm: StreamingLLMProvider = FallbackStreamingLLMProvider(
         primary=GeminiLLMProvider(),
-        secondary=ExtractiveFallbackProvider(),
+        secondary=FallbackLLMProvider(
+            primary=GemmaLocalLLMProvider(),
+            secondary=ExtractiveFallbackProvider(),
+        ),
     )
 
     return Wiring(

@@ -135,3 +135,46 @@ def test_streaming_llm_no_fallback_needed_when_primary_works():
     )
     chunks = list(provider.stream_complete("system", "user"))
     assert "".join(chunks) == "fallback answer"
+def test_three_tier_llm_fallback():
+    """Verify Gemini -> Local Gemma -> Extractive Fallback 3-tier chain."""
+    primary_gemini = _AlwaysFailingLLM()
+    
+    class _WorkingGemma(LLMProvider):
+        name = "gemma-local:gemma-4-e4b"
+        def complete(self, sys_p, user_p):
+            return "gemma local response"
+
+    secondary_gemma = _WorkingGemma()
+
+    class _Extractive(LLMProvider):
+        name = "extractive-fallback"
+        def complete(self, sys_p, user_p):
+            return "extractive response"
+
+    tertiary_extractive = _Extractive()
+
+    # Tier 1 fails -> falls back to Tier 2 (Gemma)
+    chain = FallbackLLMProvider(
+        primary=primary_gemini,
+        secondary=FallbackLLMProvider(
+            primary=secondary_gemma,
+            secondary=tertiary_extractive,
+        ),
+    )
+    assert chain.complete("sys", "user") == "gemma local response"
+
+    # Tier 1 and Tier 2 fail -> falls back to Tier 3 (Extractive)
+    class _FailingGemma(LLMProvider):
+        name = "gemma-local:gemma-4-e4b"
+        def complete(self, sys_p, user_p):
+            raise OSError("Connection refused to http://127.0.0.1:1234")
+
+    failing_chain = FallbackLLMProvider(
+        primary=primary_gemini,
+        secondary=FallbackLLMProvider(
+            primary=_FailingGemma(),
+            secondary=tertiary_extractive,
+        ),
+    )
+    assert failing_chain.complete("sys", "user") == "extractive response"
+
