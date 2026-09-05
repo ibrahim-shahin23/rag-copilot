@@ -41,7 +41,7 @@ from domain.workflow_ports import ApprovalGateRepository, RunRepository
 from infrastructure.embeddings.gemini_embedding_provider import GeminiEmbeddingProvider
 from infrastructure.embeddings.tfidf_provider import TfidfEmbeddingProvider
 from infrastructure.keyword.bm25_index import BM25KeywordIndex
-from infrastructure.llm.providers import GeminiLLMProvider, ExtractiveFallbackProvider
+from infrastructure.llm.providers import GeminiLLMProvider, GemmaLocalLLMProvider, ExtractiveFallbackProvider
 from infrastructure.relational.sqlite_repository import SqliteDocumentRepository
 from infrastructure.relational.workflow_repository import SqliteWorkflowRepository
 from infrastructure.resilience.fallback_providers import FallbackEmbeddingProvider, FallbackLLMProvider
@@ -76,9 +76,13 @@ def build_wiring(data_dir: str = "data") -> Wiring:
         secondary=TfidfEmbeddingProvider(persist_path=f"{data_dir}/tfidf_vectorizer.pkl"),
     )
 
+    # 3-tier fallback chain: Gemini hosted -> Local Gemma (gemma-4-e4b) -> Extractive fallback
     llm: LLMProvider = FallbackLLMProvider(
         primary=GeminiLLMProvider(),
-        secondary=ExtractiveFallbackProvider(),
+        secondary=FallbackLLMProvider(
+            primary=GemmaLocalLLMProvider(),
+            secondary=ExtractiveFallbackProvider(),
+        ),
     )
 
     return Wiring(
