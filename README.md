@@ -1,14 +1,15 @@
-# RAG Copilot — Ingestion, Hybrid Retrieval, Evaluation & Multi-Agent Workflow
+# RAG Copilot — Ingestion, Hybrid Retrieval, Evaluation, Multi-Agent Workflow & Streaming
 
-Three fully-implemented pieces of the full capstone spec: **FR-1
+Four fully-implemented pieces of the full capstone spec: **FR-1
 (ingestion) + FR-2 (hybrid retrieval with citations and refusal)**,
 **FR-3 (evaluation harness with a real golden set and recorded baseline
-numbers)**, and **FR-4/FR-5 (a multi-agent curriculum/assessment
-pipeline behind a supervisor orchestrator, with a real approval gate)**
-— built with Clean Architecture as the foundation the rest of the system
-(API surface, security controls, streaming) will sit on top of. See
-`PLAN.md` at the repo root (one level up) for how this fits the full spec
-and what's still to build.
+numbers)**, **FR-4/FR-5 (a multi-agent curriculum/assessment pipeline
+behind a supervisor orchestrator, with a real approval gate)**, and
+**FR-6 (SSE token streaming, live agent progress events, and real client
+cancellation)** — built with Clean Architecture as the foundation the
+rest of the system (the full API surface, security controls,
+multi-tenancy) will sit on top of. See `PLAN.md` at the repo root (one
+level up) for how this fits the full spec and what's still to build.
 
 ## Architecture
 
@@ -18,26 +19,28 @@ domain/           entities.py, ports.py, errors.py,
                   Zero imports from infrastructure/, no LLM/vector-store/web-framework SDKs.
 application/      chunking.py, ingest.py, retrieve.py, tools.py, validation.py,
                   agents/ (standards_mapper, curriculum_designer, item_generator),
-                  orchestration/ (supervisor.py)
+                  orchestration/ (supervisor.py, cancellation.py)
                   Use cases + chunking strategy + the agent pipeline. Depends only on domain/ ports.
 infrastructure/   embeddings/ (tfidf + gemini + hosted-openai), vectorstore/ (numpy),
                   keyword/ (bm25), relational/ (sqlite, workflow_repository),
-                  llm/ (extractive + gemini), extraction/ (pdf/text),
-                  resilience/ (call-time fallback), config.py
+                  llm/ (extractive + gemini, both streaming-capable), extraction/ (pdf/text),
+                  resilience/ (call-time fallback, streaming + non-streaming), config.py
                   Concrete adapters implementing domain/ports.py. config.py is the
                   composition root — the only file that wires domain to infrastructure.
 interface/        cli.py — thin, imports use cases + config only.
-tests/            unit (chunking, fusion, agents, tools, validation, supervisor)
-                  + integration (full pipeline, real adapters)
+                  http_api.py — minimal FastAPI SSE transport (FR-6 slice, not the full FR-7 surface).
+tests/            unit (chunking, fusion, agents, tools, validation, supervisor,
+                  streaming LLM/answer, resilience) + integration (full pipeline,
+                  real adapters, HTTP API via TestClient + a fake-Request disconnect test)
 docs/             ADR-001 (chunking), ADR-002 (fusion), ADR-003 (eval methodology),
-                  ADR-004 (orchestration pattern)
+                  ADR-004 (orchestration pattern), ADR-005 (streaming/cancellation)
 ```
 
 **Acceptance test this satisfies**: swap `TfidfEmbeddingProvider` for
 `HostedEmbeddingProvider` (or a real neural embedder), or `NumpyVectorStore`
 for a Qdrant/pgvector adapter — you change `infrastructure/config.py` and
 add one adapter file. Nothing in `domain/` or `application/` changes. Try
-it: `grep -rn "sklearn\|rank_bm25\|sqlite3\|numpy" domain/ application/`
+it: `grep -rn "sklearn\|rank_bm25\|sqlite3\|numpy\|fastapi\|starlette\|pydantic\|httpx" domain/ application/`
 returns nothing (the only stdlib-adjacent exception is
 `concurrent.futures` in `application/orchestration/supervisor.py`, which
 is Python stdlib, not an LLM/vector-store/web-framework SDK).
@@ -241,9 +244,57 @@ is genuinely in the source) but pedagogically weak. A real LLM replaces
 this entirely once `GEMINI_API_KEY` is configured, via the same tool's
 LLM-first path.
 
+## Real-time streaming & cancellation (FR-6)
+
+```bash
+pip install -r requirements.txt   # now includes fastapi, uvicorn, httpx
+python -m uvicorn interface.http_api:app --reload
+```
+
+Two SSE endpoints (plus a health check), verified against a real live
+`uvicorn` server, not just `TestClient`:
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/ask/stream \
+    -H "Content-Type: application/json" \
+    -d '{"query": "What does FR-2 require about citations?", "data_dir": "data"}'
+
+curl -N -X POST http://127.0.0.1:8000/workflow/stream \
+    -H "Content-Type: application/json" \
+    -d '{"target_role": "RAG Engineer", "competencies": ["hybrid retrieval"], "data_dir": "data"}'
+
+curl -X POST http://127.0.0.1:8000/workflow/cancel/<run_id>
+```
+
+Full design writeup: `docs/ADR-005-streaming-and-cancellation.md`. In
+short:
+- **SSE, not WebSocket** — all real-time traffic here is server-to-client
+  only; SSE is the simpler protocol for that shape.
+- **A separate `StreamingLLMProvider` port**, not a new required method on
+  the existing `LLMProvider` — adding one there would have broken every
+  test fake across the suite that only implements `complete()`.
+- **`Supervisor.run()` now wraps `run_streaming()`** — a real refactor,
+  pinned down by running the entire pre-existing `test_supervisor.py`
+  suite unmodified immediately after, before writing a single new
+  streaming test.
+- **Real cancellation**, two independent mechanisms: connection-close
+  detection (`request.is_disconnected()`) and an explicit
+  `POST /workflow/cancel/{run_id}` (necessary because browser
+  `EventSource` gives client code no other way to trigger a disconnect on
+  demand). Both stop the *next* pipeline step from starting — not an
+  in-flight one, since Python can't forcibly kill a running thread (same
+  limitation ADR-004 already documented for per-step timeouts).
+- **Honest testing note**: a first attempt at testing real mid-stream
+  disconnection via `TestClient` wasn't meaningful — this demo pipeline
+  finishes before there's a real window to close the connection, so that
+  would only test httpx/Starlette transport timing. Fixed with a
+  deterministic test that calls the endpoint directly against a fake
+  `Request` (`tests/test_http_api.py`).
+
 ## Explicitly out of scope for this slice
-Streaming (FR-6), the full HTTP API/UI (FR-7 — the CLI covers the same
-operations, just not over HTTP with OpenAPI docs), auth/roles (FR-8),
-tracing/cost accounting (FR-9), multi-tenancy, and the OWASP Top 10
-controls beyond the one injection test in `tests/test_ingest_retrieve_integration.py`.
-These are sequenced in `PLAN.md`.
+The full HTTP API/UI beyond the two streaming endpoints (FR-7 — no
+OpenAPI docs, no CRUD surface for ingest/approvals over HTTP yet, no
+persistent session history), auth/roles (FR-8), tracing/cost accounting
+(FR-9), multi-tenancy, and the OWASP Top 10 controls beyond the one
+injection test in `tests/test_ingest_retrieve_integration.py`. These are
+sequenced in `PLAN.md`.

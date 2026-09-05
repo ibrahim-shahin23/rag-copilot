@@ -36,7 +36,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from domain.ports import DocumentRepository, EmbeddingProvider, KeywordIndex, LLMProvider, VectorStore
+from domain.ports import DocumentRepository, EmbeddingProvider, KeywordIndex, StreamingLLMProvider, VectorStore
 from domain.workflow_ports import ApprovalGateRepository, RunRepository
 from infrastructure.embeddings.gemini_embedding_provider import GeminiEmbeddingProvider
 from infrastructure.embeddings.tfidf_provider import TfidfEmbeddingProvider
@@ -44,7 +44,7 @@ from infrastructure.keyword.bm25_index import BM25KeywordIndex
 from infrastructure.llm.providers import GeminiLLMProvider, GemmaLocalLLMProvider, ExtractiveFallbackProvider
 from infrastructure.relational.sqlite_repository import SqliteDocumentRepository
 from infrastructure.relational.workflow_repository import SqliteWorkflowRepository
-from infrastructure.resilience.fallback_providers import FallbackEmbeddingProvider, FallbackLLMProvider
+from infrastructure.resilience.fallback_providers import FallbackEmbeddingProvider, FallbackStreamingLLMProvider
 from infrastructure.vectorstore.numpy_store import NumpyVectorStore
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -57,7 +57,8 @@ class Wiring:
     embedder: EmbeddingProvider
     vector_store: VectorStore
     keyword_index: KeywordIndex
-    llm: LLMProvider
+    llm: StreamingLLMProvider  # a strict superset of LLMProvider (FR-6) — every
+                               # existing .complete()-only call site still works unchanged
     workflow_repo: RunRepository  # also implements ApprovalGateRepository
 
 
@@ -76,8 +77,7 @@ def build_wiring(data_dir: str = "data") -> Wiring:
         secondary=TfidfEmbeddingProvider(persist_path=f"{data_dir}/tfidf_vectorizer.pkl"),
     )
 
-    # 3-tier fallback chain: Gemini hosted -> Local Gemma (gemma-4-e4b) -> Extractive fallback
-    llm: LLMProvider = FallbackLLMProvider(
+    llm: StreamingLLMProvider = FallbackStreamingLLMProvider(
         primary=GeminiLLMProvider(),
         secondary=FallbackLLMProvider(
             primary=GemmaLocalLLMProvider(),

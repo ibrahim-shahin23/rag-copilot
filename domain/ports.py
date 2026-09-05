@@ -97,3 +97,22 @@ class LLMProvider(ABC):
     @abstractmethod
     def name(self) -> str:
         ...
+
+
+class StreamingLLMProvider(LLMProvider):
+    """Extends LLMProvider with token-level streaming (FR-6). Deliberately
+    a separate ABC rather than a new abstract method on LLMProvider
+    itself: LLMProvider already has many test fakes across the suite
+    (tests/test_fusion.py, test_supervisor.py, etc.) that implement only
+    complete() — adding a required stream_complete() there would break
+    every one of them for no benefit, since most of that test code never
+    needs streaming. Concrete providers that DO support streaming
+    (ExtractiveFallbackProvider, GeminiLLMProvider) implement this
+    instead; code that needs streaming specifically depends on this type,
+    not on LLMProvider."""
+
+    @abstractmethod
+    def stream_complete(self, system_prompt: str, user_prompt: str) -> Iterable[str]:
+        """Yields text chunks (not necessarily single tokens — provider-
+        dependent granularity) as they become available."""
+        ...

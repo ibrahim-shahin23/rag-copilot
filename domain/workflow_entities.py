@@ -150,6 +150,7 @@ class RunStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     DEGRADED = "degraded"
+    CANCELLED = "cancelled"  # FR-6: client cancellation, distinct from a failure — never degrades to plain RAG
 
 
 @dataclass
@@ -163,3 +164,21 @@ class Run:
     @staticmethod
     def new(target_role: str) -> "Run":
         return Run(id=str(uuid.uuid4()), target_role=target_role)
+
+
+# --- FR-6: real-time progress events -----------------------------------------
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """Emitted by Supervisor.run_streaming() as the pipeline executes —
+    what a client subscribes to over SSE/WebSocket to get live progress
+    instead of a frozen spinner. Deliberately a flat, small, JSON-
+    serializable shape (no Chunk/Answer objects embedded) since this is
+    what crosses the process boundary to a client."""
+
+    run_id: str
+    event_type: str  # run_started | step_started | step_failed | step_retrying | step_succeeded | run_cancelled | degraded | run_finished
+    step_index: Optional[int]
+    agent_name: Optional[str]
+    message: str
+    timestamp: datetime = field(default_factory=_now)
