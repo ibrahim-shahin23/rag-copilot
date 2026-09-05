@@ -1,9 +1,10 @@
 import urllib.error
 
-from domain.ports import EmbeddingProvider, LLMProvider
+from domain.ports import EmbeddingProvider, LLMProvider, StreamingLLMProvider
 from infrastructure.resilience.fallback_providers import (
     FallbackEmbeddingProvider,
     FallbackLLMProvider,
+    FallbackStreamingLLMProvider,
 )
 
 
@@ -70,3 +71,67 @@ def test_not_configured_runtime_error_also_degrades():
         primary=_Unconfigured(), secondary=_WorkingLocalEmbedder()
     )
     assert provider.embed(["x"]) == [[1.0, 0.0]]
+
+
+# --- FR-6: streaming fallback ---
+
+class _FailsImmediatelyStreaming(StreamingLLMProvider):
+    name = "fails-immediately-streaming"
+
+    def complete(self, system_prompt, user_prompt):
+        raise RuntimeError("not configured")
+
+    def stream_complete(self, system_prompt, user_prompt):
+        raise RuntimeError("not configured")
+        yield  # pragma: no cover - unreachable, makes this a generator function
+
+
+class _FailsMidStreamStreaming(StreamingLLMProvider):
+    name = "fails-mid-stream"
+
+    def complete(self, system_prompt, user_prompt):
+        raise RuntimeError("n/a")
+
+    def stream_complete(self, system_prompt, user_prompt):
+        yield "partial "
+        yield "output "
+        raise urllib.error.HTTPError("https://example.com", 429, "Too Many Requests", {}, None)
+
+
+class _WorkingStreamingLLM(StreamingLLMProvider):
+    name = "working-streaming-llm"
+
+    def complete(self, system_prompt, user_prompt):
+        return "fallback answer"
+
+    def stream_complete(self, system_prompt, user_prompt):
+        yield "fallback "
+        yield "answer"
+
+
+def test_streaming_llm_degrades_immediately_on_first_chunk_failure():
+    provider = FallbackStreamingLLMProvider(
+        primary=_FailsImmediatelyStreaming(), secondary=_WorkingStreamingLLM()
+    )
+    chunks = list(provider.stream_complete("system", "user"))
+    assert "".join(chunks) == "fallback answer"
+
+
+def test_streaming_llm_degrades_mid_stream_by_restarting_with_secondary():
+    """Documented limitation: a failure partway through primary's stream
+    means the client sees primary's partial output, THEN secondary's full
+    output from scratch — not a seamless resume. This test pins down that
+    exact (stated, not hidden) behavior."""
+    provider = FallbackStreamingLLMProvider(
+        primary=_FailsMidStreamStreaming(), secondary=_WorkingStreamingLLM()
+    )
+    chunks = list(provider.stream_complete("system", "user"))
+    assert "".join(chunks) == "partial output fallback answer"
+
+
+def test_streaming_llm_no_fallback_needed_when_primary_works():
+    provider = FallbackStreamingLLMProvider(
+        primary=_WorkingStreamingLLM(), secondary=_FailsImmediatelyStreaming()
+    )
+    chunks = list(provider.stream_complete("system", "user"))
+    assert "".join(chunks) == "fallback answer"

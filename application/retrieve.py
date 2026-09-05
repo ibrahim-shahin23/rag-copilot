@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Iterator
 
-from domain.entities import Answer, Chunk, Citation
-from domain.ports import EmbeddingProvider, KeywordIndex, LLMProvider, VectorStore
+from domain.entities import Answer, AnswerStreamEvent, Chunk, Citation
+from domain.ports import EmbeddingProvider, KeywordIndex, LLMProvider, StreamingLLMProvider, VectorStore
 
 _SECTION_REF_RE = re.compile(r"\b(?:FR|ADR|NFR)-\d+\b|\bsection\s+\d+(?:\.\d+)*\b", re.IGNORECASE)
 
@@ -142,3 +143,67 @@ class AnswerQueryUseCase:
             for chunk, score in fused
         )
         return Answer(query=query, text=answer_text, citations=citations, refused=False)
+
+    def execute_streaming(self, query: str) -> Iterator[AnswerStreamEvent]:
+        """FR-6 streaming counterpart to execute(). Retrieval and the
+        refusal decision happen synchronously first, exactly as in
+        execute() — citations and the refuse-or-answer call both depend
+        on the fully-fused retrieval result, so there's nothing to stream
+        incrementally about them. Only the LLM's answer text is actually
+        streamed, token-by-token (provider-dependent chunk granularity),
+        via a StreamingLLMProvider. Requires the configured llm to
+        support streaming; raises a clear TypeError immediately (before
+        yielding anything) if it doesn't, rather than failing confusingly
+        partway through."""
+        cfg = self._cfg
+        fused = self.retrieve(query)
+
+        if not fused or fused[0][1] < cfg.refusal_threshold:
+            answer = Answer(
+                query=query,
+                text=(
+                    "I don't have enough evidence in the ingested corpus to "
+                    "answer that confidently, so I'm declining rather than "
+                    "guessing. Try rephrasing, or confirm the relevant "
+                    "document has been ingested."
+                ),
+                citations=(),
+                refused=True,
+            )
+            yield AnswerStreamEvent(kind="token", text=answer.text)
+            yield AnswerStreamEvent(kind="done", text="", answer=answer)
+            return
+
+        if not isinstance(self._llm, StreamingLLMProvider):
+            raise TypeError(
+                f"execute_streaming() requires a StreamingLLMProvider; "
+                f"{type(self._llm).__name__} only implements LLMProvider.complete(). "
+                f"Use execute() instead, or configure a streaming-capable provider."
+            )
+
+        excerpts_block = "\n\n".join(
+            f"[{i+1}] (source={chunk.metadata.source}, "
+            f"section={chunk.metadata.section or 'n/a'}): {chunk.text}"
+            for i, (chunk, _score) in enumerate(fused)
+        )
+        user_prompt = f"Question: {query}\n\nExcerpts:\n{excerpts_block}"
+
+        full_text_parts: list[str] = []
+        for token_chunk in self._llm.stream_complete(_SYSTEM_PROMPT, user_prompt):
+            full_text_parts.append(token_chunk)
+            yield AnswerStreamEvent(kind="token", text=token_chunk)
+
+        citations = tuple(
+            Citation(
+                chunk_id=chunk.id,
+                source=chunk.metadata.source,
+                section=chunk.metadata.section,
+                position=chunk.metadata.position,
+                score=round(score, 6),
+            )
+            for chunk, score in fused
+        )
+        answer = Answer(
+            query=query, text="".join(full_text_parts), citations=citations, refused=False,
+        )
+        yield AnswerStreamEvent(kind="done", text="", answer=answer)

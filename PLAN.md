@@ -38,12 +38,12 @@ code review discipline.
 orchestration pattern, vector store choice, and the twist's central
 decision): ADR-001 (chunking) ✅, ADR-002 (retrieval fusion) ✅, ADR-003
 (evaluation methodology — bonus, not one of the four required topics) ✅,
-ADR-004 (orchestration pattern) ✅. Still missing: a dedicated vector store
-choice ADR (the numpy MVP vs. pgvector/Qdrant tradeoff is described in §2's
-stack table but not yet formalized as its own ADR) and a twist's-central-
-decision ADR (the education vertical's agent design is documented in §4
-but, similarly, not yet its own ADR). Tracked here rather than silently
-assumed done.
+ADR-004 (orchestration pattern) ✅, ADR-005 (streaming/cancellation —
+bonus) ✅. Still missing: a dedicated vector store choice ADR (the numpy
+MVP vs. pgvector/Qdrant tradeoff is described in §2's stack table but not
+yet formalized as its own ADR) and a twist's-central-decision ADR (the
+education vertical's agent design is documented in §4 but, similarly, not
+yet its own ADR). Tracked here rather than silently assumed done.
 
 ## 2. Stack
 
@@ -70,7 +70,7 @@ assumed done.
 | FR-3 Evaluation | golden set + harness (`eval/`) | ✅ built |
 | FR-4 Multi-agent | Standards Mapper, Curriculum Designer, Item Generator + orchestrator | ✅ built |
 | FR-5 Orchestration | Supervisor pattern, approval gate, run inspector | ✅ built |
-| FR-6 Real-time | SSE endpoint, cancellation token propagated to agent loop | Not built |
+| FR-6 Real-time | SSE endpoint, cancellation token propagated to agent loop | ✅ built |
 | FR-7 Surface | FastAPI + OpenAPI + minimal UI | Not built |
 | FR-8 Access | Auth (JWT) + instructor/reviewer vs. contributor roles | Not built |
 | FR-9 Observability | Correlation ID middleware, cost ledger table | Not built |
@@ -183,6 +183,56 @@ lexical matching — and is expected to close substantially once a real
 embedding model replaces the offline TF-IDF fallback. Both are tracked in
 §8's roadmap rather than being called "done."
 
+## 5A. Real-time (FR-6) — ✅ built
+
+Token-level streaming (SSE) and live agent progress events, plus real
+client cancellation. Full design writeup:
+`docs/ADR-005-streaming-and-cancellation.md`.
+
+- **`StreamingLLMProvider`** (`domain/ports.py`) — a separate ABC extending
+  `LLMProvider` rather than a new required method on it, specifically to
+  avoid breaking every existing test fake that only implements
+  `complete()`. Both `GeminiLLMProvider` and `ExtractiveFallbackProvider`
+  implement it; `FallbackStreamingLLMProvider`
+  (`infrastructure/resilience/`) provides the same call-time degradation
+  behavior as the non-streaming fallback, restarting from the secondary
+  provider if the primary fails mid-stream (a stated limitation, not
+  hidden — see ADR-005).
+- **`AnswerQueryUseCase.execute_streaming()`** — retrieval and the
+  refuse-or-answer decision still happen synchronously first (citations
+  can't trickle in incrementally, since they depend on the fully-fused
+  retrieval result); only the LLM's answer text actually streams.
+- **`Supervisor.run_streaming()`** — yields `ProgressEvent`s
+  (`run_started`, `step_started`, `step_failed`, `step_retrying`,
+  `step_succeeded`, `run_cancelled`, `degraded`, `run_finished`) as the
+  pipeline executes. `Supervisor.run()` is now a thin wrapper that drains
+  this generator — there is exactly one pipeline implementation, streamed
+  or not, confirmed by the full pre-existing `test_supervisor.py` suite
+  passing unmodified immediately after that refactor.
+- **Real cancellation** (`application/orchestration/cancellation.py`) —
+  a `CancellationToken` checked at every step boundary, raising
+  `RunCancelled` (handled distinctly from a pipeline failure — a
+  cancelled run must never silently become a degraded-but-still-answered
+  one). Honest scope: this stops the *next* step from starting, not an
+  in-flight one — Python can't forcibly kill a running thread, the same
+  limitation ADR-004 already documented for per-step timeouts.
+- **`interface/http_api.py`** — a minimal FastAPI transport (not the full
+  FR-7 surface, just what streaming/cancellation require): `/ask/stream`,
+  `/workflow/stream`, and `/workflow/cancel/{run_id}`, all verified
+  against a real live `uvicorn` server, not just `TestClient`. Two
+  independent cancellation mechanisms: connection-close detection
+  (`request.is_disconnected()`) and the explicit cancel endpoint —
+  necessary because browser `EventSource` gives client code no hook to
+  trigger a disconnect on demand.
+- **Testing note**: a first attempt at testing real mid-stream
+  disconnection via `TestClient` wasn't meaningful — this demo pipeline
+  runs fast enough that the generator finishes before there's a real
+  window to close the connection, which would only test httpx/Starlette
+  transport timing. Fixed by calling the endpoint directly with a fake
+  `Request` whose `is_disconnected()` flips to `True` after a controlled
+  number of calls — deterministic, and it exercises the actual
+  cancel-and-stop-forwarding branch. See ADR-005 for the full reasoning.
+
 ## 6. Security (FR-5 §5 requirements, planned control set)
 
 `docs/SECURITY.md` will map each control to the threat it addresses:
@@ -217,8 +267,11 @@ assert zero rows returned.
 3. ✅ **Multi-agent pipeline** (Standards Mapper → Curriculum Designer →
    Item Generator) + supervisor + approval gate (this repo, done — see §4
    above)
-4. Streaming + cancellation — next priority
-5. FastAPI surface + OpenAPI + minimal UI + auth/roles
+4. ✅ **Streaming + cancellation** (this repo, done — see §5A above)
+5. FastAPI surface + OpenAPI + minimal UI + auth/roles — next priority;
+   `interface/http_api.py` already covers the two streaming endpoints, so
+   this milestone is "build the rest of the surface around it," not
+   starting from nothing
 6. Multi-tenancy + Postgres migration off SQLite/numpy MVP adapters
 7. Observability (correlation IDs, cost ledger, tracing) + SECURITY.md
 8. Packaging (`docker compose up`, `.env.example`), CI, branch protection,

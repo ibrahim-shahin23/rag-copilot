@@ -121,3 +121,17 @@ class Answer:
     def __post_init__(self):
         if self.refused and self.citations:
             raise ValueError("A refused answer must not carry citations")
+
+
+@dataclass(frozen=True)
+class AnswerStreamEvent:
+    """FR-6: emitted by AnswerQueryUseCase.execute_streaming(). `kind` is
+    either "token" (an incremental text chunk — `text` is populated,
+    `answer` is None) or "done" (the stream is complete — `text` is empty,
+    `answer` carries the full structured Answer with citations). Citations
+    are only known once retrieval + the refusal decision are made, both of
+    which happen before any token is streamed — so they can't trickle in
+    incrementally themselves; they arrive whole, in the final event."""
+    kind: str
+    text: str
+    answer: Optional[Answer] = None

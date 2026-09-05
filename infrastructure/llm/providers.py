@@ -9,17 +9,21 @@ for lack of a configured API key and because generativelanguage.googleapis.com
 isn't reachable from this sandbox's network policy — but wiring it in is a
 one-line config change (see infrastructure/config.py), which is exactly the
 point of the provider-abstraction requirement.
+
+Both implement StreamingLLMProvider (FR-6), not just LLMProvider — see
+domain/ports.py's docstring for why that's a separate interface.
 """
 from __future__ import annotations
 
 import json
 import os
 import urllib.request
+from typing import Iterable, Iterator
 
-from domain.ports import LLMProvider
+from domain.ports import StreamingLLMProvider
 
 
-class ExtractiveFallbackProvider(LLMProvider):
+class ExtractiveFallbackProvider(StreamingLLMProvider):
     """Graceful-degradation provider (FR-5): when no real LLM is
     configured/reachable, synthesize an answer by stitching the
     highest-signal sentences out of the retrieved excerpts instead of
@@ -40,8 +44,22 @@ class ExtractiveFallbackProvider(LLMProvider):
             "responses are excerpt selections, not synthesized prose.)"
         )
 
+    def stream_complete(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        """No real token-by-token generation happens here (there's no
+        model), so this chunks the same deterministic text complete()
+        would return into words — enough to exercise/demo the streaming
+        transport (SSE framing, incremental client rendering, mid-stream
+        cancellation) without needing a hosted model configured. Each
+        yielded chunk includes its trailing space so concatenation
+        reconstructs the original text exactly, tested in
+        tests/test_streaming_llm.py."""
+        text = self.complete(system_prompt, user_prompt)
+        words = text.split(" ")
+        for i, word in enumerate(words):
+            yield word + (" " if i < len(words) - 1 else "")
 
-class GeminiLLMProvider(LLMProvider):
+
+class GeminiLLMProvider(StreamingLLMProvider):
     """Google Gemini adapter, called directly over REST (no SDK dependency,
     consistent with the embedding adapters) so this file stays importable
     even in environments that never configure a Gemini key.
@@ -71,15 +89,19 @@ class GeminiLLMProvider(LLMProvider):
     def is_configured(self) -> bool:
         return bool(self._api_key)
 
-    def complete(self, system_prompt: str, user_prompt: str) -> str:
+    def _require_key(self) -> str:
         if not self._api_key:
             raise RuntimeError(
                 "GeminiLLMProvider requires GEMINI_API_KEY. This is "
-                "expected to be caught by FallbackLLMProvider "
-                "(infrastructure/resilience/) and degrade to the "
-                "extractive fallback — see build_wiring() in "
-                "infrastructure/config.py."
+                "expected to be caught by FallbackLLMProvider / "
+                "FallbackStreamingLLMProvider (infrastructure/resilience/) "
+                "and degrade to the extractive fallback — see "
+                "build_wiring() in infrastructure/config.py."
             )
+        return self._api_key
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        api_key = self._require_key()
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self._model}:generateContent"
@@ -94,10 +116,55 @@ class GeminiLLMProvider(LLMProvider):
             data=json.dumps(payload).encode(),
             headers={
                 "Content-Type": "application/json",
-                "x-goog-api-key": self._api_key,
+                "x-goog-api-key": api_key,
             },
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = json.loads(resp.read())
         parts = body["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts)
+
+    def stream_complete(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        """Uses Gemini's streamGenerateContent endpoint with alt=sse,
+        which returns standard `data: {...}\\n\\n` SSE framing — parsed
+        directly rather than pulling in an SSE client library, consistent
+        with this file's no-SDK style. Not exercised live in this sandbox
+        (no network egress to generativelanguage.googleapis.com, no
+        configured key), so this is real code written against Gemini's
+        documented streaming response shape, not a tested integration —
+        stated plainly rather than implied otherwise."""
+        api_key = self._require_key()
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self._model}:streamGenerateContent?alt=sse"
+        )
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"maxOutputTokens": 1000},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if not data_str:
+                    continue
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                for candidate in chunk.get("candidates", []):
+                    for part in candidate.get("content", {}).get("parts", []):
+                        text = part.get("text", "")
+                        if text:
+                            yield text

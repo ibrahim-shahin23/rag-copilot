@@ -14,6 +14,7 @@ from domain.workflow_entities import (
     RunStep,
 )
 from domain.workflow_ports import ApprovalGateRepository, RunRepository
+from application.orchestration.cancellation import CancellationToken
 from application.orchestration.supervisor import Supervisor, SupervisorConfig
 from application.tools import SubmitForApprovalTool
 
@@ -327,3 +328,139 @@ def test_invalid_item_is_still_submitted_but_flagged_not_silently_dropped():
     assert len(pending) == 1
     assert pending[0].validation_passed is False
     assert "not found verbatim" in pending[0].validation_notes
+
+
+# --- FR-6: streaming progress events ---
+
+def test_run_streaming_yields_events_in_order_for_happy_path():
+    sm, cd, ig = _happy_path_agents()
+    supervisor, repo, fallback_uc = _build_supervisor(sm, cd, ig)
+
+    events = list(supervisor.run_streaming(target_role="Role", competencies=["x"]))
+
+    event_types = [e.event_type for e in events]
+    assert event_types[0] == "run_started"
+    assert event_types[-1] == "run_finished"
+    assert "step_started" in event_types
+    assert "step_succeeded" in event_types
+    # every event carries the same run_id — a client can distinguish
+    # concurrent runs by this field alone
+    assert len({e.run_id for e in events}) == 1
+    # step_started for an agent must precede its step_succeeded
+    sm_started = event_types.index("step_started")
+    sm_succeeded_indices = [i for i, t in enumerate(event_types) if t == "step_succeeded"]
+    assert sm_succeeded_indices[0] > sm_started
+
+
+def test_run_streaming_emits_retry_events_matching_run_behavior():
+    attempts = {"n": 0}
+
+    def flaky_fn(target_role, competencies):
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise ValueError("transient")
+        return CompetencyGapReport(target_role=target_role, gaps=())
+
+    sm = _FakeAgent(flaky_fn)
+    cd = _FakeAgent(lambda gr: ModuleOutline(target_role="Role", modules=()))
+    ig = _FakeAgent(lambda module: [])
+    config = SupervisorConfig(max_retries=1, step_timeout_seconds=5.0, backoff_base_seconds=0.001)
+    supervisor, repo, _ = _build_supervisor(sm, cd, ig, config=config)
+
+    events = list(supervisor.run_streaming(target_role="Role", competencies=["x"]))
+    event_types = [e.event_type for e in events]
+    assert event_types.count("step_failed") == 1
+    assert event_types.count("step_retrying") == 1
+    # two steps run in total (standards_mapper, curriculum_designer; no
+    # modules -> no item_generator step), both eventually succeed
+    assert event_types.count("step_succeeded") == 2
+    sm_events = [e for e in events if e.agent_name == "standards_mapper"]
+    assert [e.event_type for e in sm_events] == [
+        "step_started", "step_failed", "step_retrying", "step_succeeded",
+    ]
+
+
+def test_run_and_run_streaming_produce_identical_final_run_state():
+    """run() is implemented on top of run_streaming() specifically so
+    they can't drift apart — this pins that down directly."""
+    sm, cd, ig = _happy_path_agents()
+    supervisor1, repo1, _ = _build_supervisor(sm, cd, ig)
+    run_via_run = supervisor1.run(target_role="Role", competencies=["x"])
+
+    sm2, cd2, ig2 = _happy_path_agents()
+    supervisor2, repo2, _ = _build_supervisor(sm2, cd2, ig2)
+    events = list(supervisor2.run_streaming(target_role="Role", competencies=["x"]))
+    run_via_streaming = repo2.get_run(events[0].run_id)
+
+    assert run_via_run.status == run_via_streaming.status == RunStatus.SUCCEEDED
+    assert len(repo1.list_pending()) == len(repo2.list_pending())
+
+
+# --- FR-6: cancellation ---
+
+def test_cancellation_before_first_step_stops_all_work():
+    sm, cd, ig = _happy_path_agents()
+    supervisor, repo, fallback_uc = _build_supervisor(sm, cd, ig)
+    token = CancellationToken()
+    token.cancel()  # cancelled before the run even starts
+
+    events = list(supervisor.run_streaming(target_role="Role", competencies=["x"], cancellation_token=token))
+
+    event_types = [e.event_type for e in events]
+    assert "run_cancelled" in event_types
+    assert "step_started" not in event_types  # no agent work was ever started
+    run = repo.get_run(events[0].run_id)
+    assert run.status == RunStatus.CANCELLED
+    assert fallback_uc.calls == []  # cancellation must NOT trigger graceful degradation
+    assert repo.list_pending() == []  # nothing generated, nothing submitted
+
+
+def test_cancellation_between_steps_stops_remaining_steps():
+    """Cancel after standards_mapper has already succeeded — item
+    generation for later modules must never start."""
+    sm, cd, ig = _happy_path_agents()
+    token = CancellationToken()
+
+    call_log = []
+    original_cd_execute = cd.execute
+
+    def cd_execute_and_cancel(gr):
+        result = original_cd_execute(gr)
+        token.cancel()  # simulate the client disconnecting right after this step
+        call_log.append("curriculum_designer ran")
+        return result
+
+    cd.execute = cd_execute_and_cancel
+
+    supervisor, repo, fallback_uc = _build_supervisor(sm, cd, ig)
+    events = list(supervisor.run_streaming(target_role="Role", competencies=["x"], cancellation_token=token))
+
+    assert call_log == ["curriculum_designer ran"]  # curriculum_designer DID run
+    event_types = [e.event_type for e in events]
+    assert "run_cancelled" in event_types
+    # item_generator's step_started must never appear — cancellation caught
+    # at the next step boundary, before item_generator (the next agent) runs
+    item_gen_started = [
+        e for e in events if e.event_type == "step_started" and e.agent_name == "item_generator"
+    ]
+    assert item_gen_started == []
+    run = repo.get_run(events[0].run_id)
+    assert run.status == RunStatus.CANCELLED
+    assert fallback_uc.calls == []
+    assert repo.list_pending() == []  # item_generator never ran, nothing to submit
+
+
+def test_cancellation_takes_precedence_over_degradation():
+    """A cancelled run must end as CANCELLED, never DEGRADED — even
+    though both paths originate from an exception caught in run_streaming."""
+    sm, cd, ig = _happy_path_agents()
+    token = CancellationToken()
+    token.cancel()
+    supervisor, repo, fallback_uc = _build_supervisor(sm, cd, ig)
+
+    events = list(supervisor.run_streaming(target_role="Role", competencies=["x"], cancellation_token=token))
+    run = repo.get_run(events[0].run_id)
+
+    assert run.status == RunStatus.CANCELLED
+    assert run.status != RunStatus.DEGRADED
+    assert fallback_uc.calls == []
