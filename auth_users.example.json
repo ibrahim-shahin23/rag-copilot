@@ -1,0 +1,10 @@
+{
+    "contributor-demo-key": {
+        "username": "alice",
+        "role": "contributor"
+    },
+    "reviewer-demo-key": {
+        "username": "lead-instructor",
+        "role": "reviewer"
+    }
+}

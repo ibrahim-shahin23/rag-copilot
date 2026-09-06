@@ -1,12 +1,9 @@
-.venv
-.env
-interface/data/
 __pycache__/
-*.py[cod]
-*$py.class
 *.pyc
 .pytest_cache/
 data/
 eval/_data/
+.env
+auth_users.json
+.venv/
 venv/
- 
