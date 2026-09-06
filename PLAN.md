@@ -39,11 +39,12 @@ orchestration pattern, vector store choice, and the twist's central
 decision): ADR-001 (chunking) ✅, ADR-002 (retrieval fusion) ✅, ADR-003
 (evaluation methodology — bonus, not one of the four required topics) ✅,
 ADR-004 (orchestration pattern) ✅, ADR-005 (streaming/cancellation —
-bonus) ✅. Still missing: a dedicated vector store choice ADR (the numpy
-MVP vs. pgvector/Qdrant tradeoff is described in §2's stack table but not
-yet formalized as its own ADR) and a twist's-central-decision ADR (the
-education vertical's agent design is documented in §4 but, similarly, not
-yet its own ADR). Tracked here rather than silently assumed done.
+bonus) ✅, ADR-006 (access control — bonus) ✅. Still missing: a dedicated
+vector store choice ADR (the numpy MVP vs. pgvector/Qdrant tradeoff is
+described in §2's stack table but not yet formalized as its own ADR) and
+a twist's-central-decision ADR (the education vertical's agent design is
+documented in §4 but, similarly, not yet its own ADR). Tracked here rather
+than silently assumed done.
 
 ## 2. Stack
 
@@ -71,8 +72,8 @@ yet its own ADR). Tracked here rather than silently assumed done.
 | FR-4 Multi-agent | Standards Mapper, Curriculum Designer, Item Generator + orchestrator | ✅ built |
 | FR-5 Orchestration | Supervisor pattern, approval gate, run inspector | ✅ built |
 | FR-6 Real-time | SSE endpoint, cancellation token propagated to agent loop | ✅ built |
-| FR-7 Surface | FastAPI + OpenAPI + minimal UI | Not built |
-| FR-8 Access | Auth (JWT) + instructor/reviewer vs. contributor roles | Not built |
+| FR-7 Surface | FastAPI + OpenAPI + minimal UI | ✅ built |
+| FR-8 Access | Auth (JWT) + instructor/reviewer vs. contributor roles | ✅ built (API-key based, not JWT — see ADR-006) |
 | FR-9 Observability | Correlation ID middleware, cost ledger table | Not built |
 | Multi-tenancy | tenant_id column + Postgres RLS policy on every table | Not built |
 | Security (§5) | `docs/SECURITY.md` control-to-threat mapping | Not built |
@@ -233,6 +234,54 @@ client cancellation. Full design writeup:
   number of calls — deterministic, and it exercises the actual
   cancel-and-stop-forwarding branch. See ADR-005 for the full reasoning.
 
+## 5B. Surface & Access Control (FR-7/FR-8) — ✅ built
+
+Full design writeup: `docs/ADR-006-access-control.md`.
+
+- **`interface/http_api.py`** now covers every FR-7-listed operation:
+  `POST /ingest`, `POST /ask` (+ `/ask/stream`), `POST /workflow/run`
+  (+ `/workflow/stream`, `/workflow/cancel/{run_id}`),
+  `GET /workflow/trace/{run_id}`, `GET /approvals` +
+  `POST /approvals/{item_id}/decide`, and `GET /sessions` for FR-7's
+  persistent session history — every authenticated call records a
+  `SessionEvent` durably in SQLite. OpenAPI docs are FastAPI's automatic
+  `/docs` and `/openapi.json`, verified in `tests/test_http_api.py` to
+  actually list every one of these paths, not just assumed.
+- **Two roles, split by generation vs. oversight (FR-8)**: `CONTRIBUTOR`
+  (ingest, ask, run/cancel the workflow) and `REVIEWER` (view/decide
+  approvals, inspect a trace) — deliberately non-overlapping, not a
+  simple read/write split, because a CONTRIBUTOR approving their own
+  generated items would defeat FR-4's human-in-the-loop point. Enforced
+  server-side via a FastAPI dependency checked *before* the endpoint body
+  runs, tested in both directions (a REVIEWER hitting CONTRIBUTOR
+  endpoints and vice versa, both expecting 403).
+- **Static, file-backed API keys** (`infrastructure/auth/`) — not a full
+  identity provider (no hashing, no expiry, no OAuth), a deliberate scope
+  cut stated in ADR-006. `auth_users.json` is git-ignored;
+  `auth_users.example.json` (checked in, obviously fake keys) is the
+  loud-warning fallback so the API works out-of-the-box in this sandbox.
+- **`decided_by` on an approval decision always comes from the
+  authenticated user**, never the request body — a REVIEWER can't
+  attribute a decision to someone else.
+- **Minimal UI**: FR-7 explicitly allows "web or CLI/TUI" —
+  `interface/cli.py` already covers ingest/ask/workflow/approvals; it's a
+  separate front door onto the same application layer, not a stub
+  standing in for the HTTP API.
+
+**Real bug found and fixed while building this**: `POST /ingest` with a
+short, realistic single-sentence document ("FR-9 requires correlation
+IDs.") returned `status: "failed"` — not hypothetical, the actual live
+response. Root cause in `application/chunking.py`: the `min_chars` filter
+(meant to drop a degenerate trailing sliver left over from windowing a
+*long* section) was applied unconditionally, including to a short
+section's *only* chunk — an ordinary short sentence could be entirely
+discarded. Fixed so the length filter only applies when a section
+actually produced more than one window. This is the second time a
+small-input edge case has surfaced a real bug in this codebase (the first
+was FR-3's small-corpus refusal-threshold findings) — worth treating as a
+pattern: keep testing with deliberately small inputs, not just
+realistic-sized ones.
+
 ## 6. Security (FR-5 §5 requirements, planned control set)
 
 `docs/SECURITY.md` will map each control to the threat it addresses:
@@ -268,11 +317,10 @@ assert zero rows returned.
    Item Generator) + supervisor + approval gate (this repo, done — see §4
    above)
 4. ✅ **Streaming + cancellation** (this repo, done — see §5A above)
-5. FastAPI surface + OpenAPI + minimal UI + auth/roles — next priority;
-   `interface/http_api.py` already covers the two streaming endpoints, so
-   this milestone is "build the rest of the surface around it," not
-   starting from nothing
-6. Multi-tenancy + Postgres migration off SQLite/numpy MVP adapters
+5. ✅ **FastAPI surface + OpenAPI + minimal UI + auth/roles** (this repo,
+   done — see §5B above)
+6. Multi-tenancy + Postgres migration off SQLite/numpy MVP adapters —
+   next priority
 7. Observability (correlation IDs, cost ledger, tracing) + SECURITY.md
 8. Packaging (`docker compose up`, `.env.example`), CI, branch protection,
    release tags — engineering-process discipline (§6) applies from

@@ -37,11 +37,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from domain.ports import DocumentRepository, EmbeddingProvider, KeywordIndex, StreamingLLMProvider, VectorStore
+from domain.session_ports import SessionRepository
 from domain.workflow_ports import ApprovalGateRepository, RunRepository
+from infrastructure.auth.static_user_repository import StaticUserRepository
 from infrastructure.embeddings.gemini_embedding_provider import GeminiEmbeddingProvider
 from infrastructure.embeddings.tfidf_provider import TfidfEmbeddingProvider
 from infrastructure.keyword.bm25_index import BM25KeywordIndex
-from infrastructure.llm.providers import GeminiLLMProvider, GemmaLocalLLMProvider, ExtractiveFallbackProvider
+from infrastructure.llm.providers import GeminiLLMProvider, ExtractiveFallbackProvider
+from infrastructure.relational.session_repository import SqliteSessionRepository
 from infrastructure.relational.sqlite_repository import SqliteDocumentRepository
 from infrastructure.relational.workflow_repository import SqliteWorkflowRepository
 from infrastructure.resilience.fallback_providers import FallbackEmbeddingProvider, FallbackStreamingLLMProvider
@@ -60,6 +63,7 @@ class Wiring:
     llm: StreamingLLMProvider  # a strict superset of LLMProvider (FR-6) — every
                                # existing .complete()-only call site still works unchanged
     workflow_repo: RunRepository  # also implements ApprovalGateRepository
+    session_repo: SessionRepository
 
 
 def build_wiring(data_dir: str = "data") -> Wiring:
@@ -67,6 +71,7 @@ def build_wiring(data_dir: str = "data") -> Wiring:
     vector_store = NumpyVectorStore(f"{data_dir}/vectors.pkl")
     keyword_index = BM25KeywordIndex(f"{data_dir}/bm25.pkl")
     workflow_repo = SqliteWorkflowRepository(f"{data_dir}/copilot.db")
+    session_repo = SqliteSessionRepository(f"{data_dir}/copilot.db")
 
     # Wrapped in a runtime fallback rather than chosen once via
     # is_configured(): a hosted provider can be configured (key present)
@@ -79,10 +84,7 @@ def build_wiring(data_dir: str = "data") -> Wiring:
 
     llm: StreamingLLMProvider = FallbackStreamingLLMProvider(
         primary=GeminiLLMProvider(),
-        secondary=FallbackLLMProvider(
-            primary=GemmaLocalLLMProvider(),
-            secondary=ExtractiveFallbackProvider(),
-        ),
+        secondary=ExtractiveFallbackProvider(),
     )
 
     return Wiring(
@@ -92,7 +94,31 @@ def build_wiring(data_dir: str = "data") -> Wiring:
         keyword_index=keyword_index,
         llm=llm,
         workflow_repo=workflow_repo,
+        session_repo=session_repo,
     )
+
+
+def build_user_repository() -> StaticUserRepository:
+    """FR-8's user store — process-level, loaded once, not per-request or
+    per-data_dir like the rest of Wiring (who's allowed to call this API
+    doesn't depend on which corpus they're querying). Looks for
+    `auth_users.json` at the project root first; falls back to the
+    checked-in `auth_users.example.json` demo credentials with a loud
+    warning if the real file doesn't exist, so the API is usable
+    out-of-the-box in a sandbox/demo without silently running with no
+    usable credentials at all — but unmistakably NOT a production
+    configuration."""
+    real_path = _PROJECT_ROOT / "auth_users.json"
+    example_path = _PROJECT_ROOT / "auth_users.example.json"
+    if real_path.exists():
+        return StaticUserRepository.from_file(real_path)
+    print(
+        f"[auth] WARNING: {real_path} not found — falling back to "
+        f"{example_path.name}'s demo credentials. Do not use these in "
+        f"production; copy auth_users.example.json to auth_users.json "
+        f"and replace the keys.",
+    )
+    return StaticUserRepository.from_file(example_path)
 
 
 def build_supervisor(wiring: Wiring):

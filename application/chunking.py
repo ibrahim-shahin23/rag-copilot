@@ -112,13 +112,28 @@ def chunk_document(document: Document, cfg: ChunkingConfig | None = None) -> lis
         chunks: list[Chunk] = []
         position = 0
         for label, section_text, section_offset in sections:
-            for chunk_text, local_start, local_end in _sliding_window(section_text, cfg):
-                if len(chunk_text.strip()) < cfg.min_chars:
+            windows = _sliding_window(section_text, cfg)
+            for i, (chunk_text, local_start, local_end) in enumerate(windows):
+                stripped = chunk_text.strip()
+                if not stripped:
+                    continue
+                # min_chars is meant to drop degenerate trailing SLIVERS
+                # left over from windowing a long section — not to
+                # disqualify a short section's only chunk. A real bug
+                # found via HTTP ingest testing: a short document (e.g. a
+                # single short sentence, no heading) produced exactly one
+                # window here, which the old unconditional min_chars
+                # check then discarded, leaving zero chunks and raising
+                # ChunkingError for a perfectly legitimate short document.
+                # Only apply the length filter when there's more than one
+                # window to filter AMONG — i.e. windowing actually
+                # happened — never to a section's sole chunk.
+                if len(windows) > 1 and len(stripped) < cfg.min_chars:
                     continue
                 chunks.append(
                     Chunk.new(
                         document=document,
-                        text=chunk_text.strip(),
+                        text=stripped,
                         section=label,
                         position=position,
                         char_start=section_offset + local_start,

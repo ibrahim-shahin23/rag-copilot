@@ -59,3 +59,30 @@ def test_content_hash_is_deterministic_for_idempotency():
     assert d1.content_hash == d2.content_hash
     d3 = _doc("different content")
     assert d1.content_hash != d3.content_hash
+
+
+def test_short_document_below_min_chars_still_chunks():
+    """Regression test for a real bug found via HTTP ingest testing: a
+    short document with no heading and no long section — its single
+    window is shorter than min_chars — used to be discarded entirely,
+    raising ChunkingError for a perfectly legitimate short document.
+    min_chars must only filter degenerate trailing slivers from actual
+    windowing, never a section's sole chunk."""
+    text = "FR-9 requires correlation IDs."  # well under the default min_chars=40
+    assert len(text) < ChunkingConfig().min_chars
+    chunks = chunk_document(_doc(text))
+    assert len(chunks) == 1
+    assert chunks[0].text == text
+
+
+def test_tiny_trailing_sliver_from_real_windowing_is_still_droppable():
+    """The min_chars fix must not disable the original 'drop a degenerate
+    trailing sliver' behavior when windowing genuinely produces more than
+    one piece — only the single-window (short section) case is exempt."""
+    sentence = "This is one sentence about retrieval quality and citations. "
+    long_section = "FR-2 Retrieval.\n" + sentence * 40
+    cfg = ChunkingConfig(max_chars=300, overlap_chars=60, min_chars=20)
+    chunks = chunk_document(_doc(long_section), cfg)
+    # every produced chunk still respects min_chars when there WAS more
+    # than one window to filter among
+    assert all(len(c.text) >= cfg.min_chars for c in chunks)

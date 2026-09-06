@@ -1,39 +1,45 @@
-# RAG Copilot — Ingestion, Hybrid Retrieval, Evaluation, Multi-Agent Workflow & Streaming
+# RAG Copilot — Ingestion, Retrieval, Evaluation, Agents, Streaming & Access Control
 
-Four fully-implemented pieces of the full capstone spec: **FR-1
+Six fully-implemented pieces of the full capstone spec: **FR-1
 (ingestion) + FR-2 (hybrid retrieval with citations and refusal)**,
 **FR-3 (evaluation harness with a real golden set and recorded baseline
 numbers)**, **FR-4/FR-5 (a multi-agent curriculum/assessment pipeline
-behind a supervisor orchestrator, with a real approval gate)**, and
-**FR-6 (SSE token streaming, live agent progress events, and real client
-cancellation)** — built with Clean Architecture as the foundation the
-rest of the system (the full API surface, security controls,
-multi-tenancy) will sit on top of. See `PLAN.md` at the repo root (one
-level up) for how this fits the full spec and what's still to build.
+behind a supervisor orchestrator, with a real approval gate)**, **FR-6
+(SSE token streaming, live agent progress events, and real client
+cancellation)**, and **FR-7/FR-8 (a full HTTP API surface with OpenAPI
+docs, persistent session history, and two roles with genuinely different,
+server-enforced permissions)** — built with Clean Architecture as the
+foundation the rest of the system (multi-tenancy, full observability)
+will sit on top of. See `PLAN.md` at the repo root (one level up) for how
+this fits the full spec and what's still to build.
 
 ## Architecture
 
 ```
 domain/           entities.py, ports.py, errors.py,
                   workflow_entities.py, workflow_ports.py (FR-4/FR-5 typed contracts)
+                  auth_entities.py, auth_ports.py (FR-8), session_entities.py, session_ports.py (FR-7)
                   Zero imports from infrastructure/, no LLM/vector-store/web-framework SDKs.
 application/      chunking.py, ingest.py, retrieve.py, tools.py, validation.py,
                   agents/ (standards_mapper, curriculum_designer, item_generator),
                   orchestration/ (supervisor.py, cancellation.py)
                   Use cases + chunking strategy + the agent pipeline. Depends only on domain/ ports.
 infrastructure/   embeddings/ (tfidf + gemini + hosted-openai), vectorstore/ (numpy),
-                  keyword/ (bm25), relational/ (sqlite, workflow_repository),
+                  keyword/ (bm25), relational/ (sqlite, workflow_repository, session_repository),
                   llm/ (extractive + gemini, both streaming-capable), extraction/ (pdf/text),
-                  resilience/ (call-time fallback, streaming + non-streaming), config.py
+                  resilience/ (call-time fallback, streaming + non-streaming),
+                  auth/ (static_user_repository.py), config.py
                   Concrete adapters implementing domain/ports.py. config.py is the
                   composition root — the only file that wires domain to infrastructure.
 interface/        cli.py — thin, imports use cases + config only.
-                  http_api.py — minimal FastAPI SSE transport (FR-6 slice, not the full FR-7 surface).
+                  http_api.py — full FR-7 surface + FR-6 streaming + FR-8 auth/roles.
 tests/            unit (chunking, fusion, agents, tools, validation, supervisor,
-                  streaming LLM/answer, resilience) + integration (full pipeline,
-                  real adapters, HTTP API via TestClient + a fake-Request disconnect test)
+                  streaming LLM/answer, resilience, auth, sessions) + integration
+                  (full pipeline, real adapters, HTTP API via TestClient +
+                  a fake-Request disconnect test)
 docs/             ADR-001 (chunking), ADR-002 (fusion), ADR-003 (eval methodology),
-                  ADR-004 (orchestration pattern), ADR-005 (streaming/cancellation)
+                  ADR-004 (orchestration pattern), ADR-005 (streaming/cancellation),
+                  ADR-006 (access control)
 ```
 
 **Acceptance test this satisfies**: swap `TfidfEmbeddingProvider` for
@@ -133,6 +139,21 @@ and confirms it degrades rather than raising).
   for both embeddings and completion. See
   `infrastructure/embeddings/gemini_embedding_provider.py` and
   `tests/test_gemini_embedding_provider.py`.
+
+- **A perfectly ordinary short document failed to ingest at all** — found
+  testing `POST /ingest` with a realistic single-sentence document over
+  HTTP, not a contrived edge case. `application/chunking.py`'s
+  `min_chars` filter (meant to drop a degenerate trailing sliver left
+  over from windowing a *long* section) was applied unconditionally,
+  including to a short section's *only* chunk — so an ordinary short
+  sentence with no heading could be entirely discarded, raising
+  `ChunkingError`. Fixed so the length filter only applies when a section
+  actually produced more than one window. Regression tests:
+  `test_short_document_below_min_chars_still_chunks`,
+  `test_tiny_trailing_sliver_from_real_windowing_is_still_droppable` in
+  `tests/test_chunking.py`. Second time a small-input edge case has
+  surfaced a real bug here (the first was FR-3's small-corpus
+  refusal-threshold findings) — worth treating as a pattern.
 
 ## Running it
 
@@ -291,10 +312,62 @@ short:
   deterministic test that calls the endpoint directly against a fake
   `Request` (`tests/test_http_api.py`).
 
+## HTTP API surface & access control (FR-7/FR-8)
+
+```bash
+cp auth_users.example.json auth_users.json   # or edit it — real demo keys, replace before any real use
+python -m uvicorn interface.http_api:app --reload
+```
+
+```bash
+# Ingest, ask, run the workflow — CONTRIBUTOR key
+curl -X POST http://127.0.0.1:8000/ingest -H "X-API-Key: contributor-demo-key" \
+    -H "Content-Type: application/json" \
+    -d '{"source": "spec.md", "doc_type": "md", "raw_text": "FR-2 requires hybrid retrieval.", "data_dir": "data"}'
+
+curl -X POST http://127.0.0.1:8000/ask -H "X-API-Key: contributor-demo-key" \
+    -H "Content-Type: application/json" \
+    -d '{"query": "What does FR-2 require?", "data_dir": "data"}'
+
+curl -X POST http://127.0.0.1:8000/workflow/run -H "X-API-Key: contributor-demo-key" \
+    -H "Content-Type: application/json" \
+    -d '{"target_role": "RAG Engineer", "competencies": ["hybrid retrieval"], "data_dir": "data"}'
+
+# View approvals, decide, inspect a trace — REVIEWER key (a CONTRIBUTOR
+# key gets 403 on all three of these; a REVIEWER key gets 403 on the three above)
+curl "http://127.0.0.1:8000/approvals?data_dir=data" -H "X-API-Key: reviewer-demo-key"
+curl -X POST http://127.0.0.1:8000/approvals/<item_id>/decide -H "X-API-Key: reviewer-demo-key" \
+    -H "Content-Type: application/json" -d '{"decision": "approve", "data_dir": "data"}'
+curl "http://127.0.0.1:8000/workflow/trace/<run_id>?data_dir=data" -H "X-API-Key: reviewer-demo-key"
+
+# Persistent session history — scoped by role
+curl "http://127.0.0.1:8000/sessions?data_dir=data" -H "X-API-Key: contributor-demo-key"  # own history only
+curl "http://127.0.0.1:8000/sessions?data_dir=data" -H "X-API-Key: reviewer-demo-key"      # everyone's
+
+# OpenAPI docs
+open http://127.0.0.1:8000/docs
+```
+
+Full design writeup: `docs/ADR-006-access-control.md`. In short:
+- **Two roles, split by generation vs. oversight, not read/write** —
+  `CONTRIBUTOR` (ingest, ask, run/cancel the workflow) and `REVIEWER`
+  (view/decide approvals, inspect a trace), deliberately non-overlapping:
+  a CONTRIBUTOR approving their own generated items would defeat FR-4's
+  human-in-the-loop point. Enforced by a FastAPI dependency checked
+  server-side before the endpoint body runs — verified in both
+  directions in `tests/test_http_api.py`, not just one.
+- **Static, file-backed API keys**, not a full identity provider — a
+  stated scope cut (ADR-006), not an oversight. `auth_users.json` is
+  git-ignored; the checked-in `auth_users.example.json` demo keys are the
+  loud-warning fallback so this works out-of-the-box in a sandbox.
+- **`decided_by` on an approval always comes from the authenticated
+  user**, never the request body.
+- **A real bug found and fixed**: `POST /ingest` with an ordinary short
+  document ("FR-9 requires correlation IDs.") failed entirely — see
+  "Known bugs" above.
+
 ## Explicitly out of scope for this slice
-The full HTTP API/UI beyond the two streaming endpoints (FR-7 — no
-OpenAPI docs, no CRUD surface for ingest/approvals over HTTP yet, no
-persistent session history), auth/roles (FR-8), tracing/cost accounting
-(FR-9), multi-tenancy, and the OWASP Top 10 controls beyond the one
-injection test in `tests/test_ingest_retrieve_integration.py`. These are
-sequenced in `PLAN.md`.
+Tracing/cost accounting (FR-9 — no correlation-ID middleware yet),
+multi-tenancy, and the OWASP Top 10 controls beyond the one injection
+test in `tests/test_ingest_retrieve_integration.py`. These are sequenced
+in `PLAN.md`.
