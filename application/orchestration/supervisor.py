@@ -79,7 +79,7 @@ class StepTimeoutError(Exception):
 @dataclass(frozen=True)
 class SupervisorConfig:
     max_iterations: int = 20
-    step_timeout_seconds: float = 10.0
+    step_timeout_seconds: float = 60.0
     max_retries: int = 2
     backoff_base_seconds: float = 0.05
 
