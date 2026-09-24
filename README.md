@@ -157,12 +157,33 @@ and confirms it degrades rather than raising).
 
 ## Running it
 
-```bash
-pip install -r requirements.txt   # numpy, scikit-learn, rank_bm25, pytest
-python -m pytest tests/ -v        # 13 tests, all passing (unit + integration)
+### Option A: Docker Compose (Single Command System + Seeding)
 
-python interface/cli.py ingest data/corpus/spec.md
+Bring up the complete system (FastAPI HTTP server, SQLite relational database, vector index, security middleware, and automatic corpus ingestion):
+
+```bash
+docker compose up --build
+```
+
+- **API Surface**: `http://localhost:8000/docs`
+- **Manual Seed Command**: `docker compose run --rm seed`
+- **Detailed Docker Guide**: See [`docs/DOCKER.md`](file:///g:/Technical%20assessment/rag-copilot/docs/DOCKER.md)
+
+### Option B: Local Python Environment
+
+```bash
+pip install -r requirements.txt   # numpy, scikit-learn, rank_bm25, pytest, fastapi, uvicorn
+python -m pytest tests/ -v        # unit + integration tests
+
+# Seed corpus
+python scripts/seed.py
+
+# Ingest and query via CLI
+python interface/cli.py ingest eval/corpus/spec.md
 python interface/cli.py ask "What does FR-2 say about citations?"
+
+# Start API Server
+python -m uvicorn interface.http_api:app --reload
 ```
 
 ## What's genuinely tested vs. what's a documented stub
