@@ -28,15 +28,19 @@ back: a CONTRIBUTOR sees their own history, a REVIEWER sees everyone's
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
+import time
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from application.ingest import IngestDocumentUseCase
 from application.orchestration.cancellation import CancellationToken
@@ -50,12 +54,83 @@ app = FastAPI(
     description=(
         "FR-7 surface (ingest, ask, workflow, approvals, trace, session "
         "history) + FR-6 streaming/cancellation, with FR-8 role-based "
-        "access control. Not the full spec's FR-9 observability layer "
-        "(no correlation-ID middleware yet) or multi-tenancy — see "
-        "PLAN.md for what's still to build."
+        "access control and security controls."
     ),
 )
 
+# --- Security Configuration & Middlewares ---
+
+# 1. CORS Configuration (Explicit origins, no wildcard default)
+allowed_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+allowed_origins = [o.strip() for o in allowed_origins_str.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["X-API-Key", "Content-Type", "Authorization"],
+)
+
+# 2. Rate Limiting Middleware (Sliding window token bucket / timestamp store)
+_RATE_LIMIT_STORE: dict[str, list[float]] = {}
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    client_key = request.headers.get("x-api-key") or request.client.host if request.client else "unknown"
+    now = time.time()
+    
+    timestamps = _RATE_LIMIT_STORE.get(client_key, [])
+    # Filter out timestamps older than window
+    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    
+    if len(timestamps) >= RATE_LIMIT_PER_MINUTE:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Please try again later."},
+            headers={
+                "Retry-After": str(int(RATE_LIMIT_WINDOW_SECONDS)),
+                "X-RateLimit-Limit": str(RATE_LIMIT_PER_MINUTE),
+                "X-RateLimit-Remaining": "0",
+            },
+        )
+    
+    timestamps.append(now)
+    _RATE_LIMIT_STORE[client_key] = timestamps
+
+    response = await call_next(request)
+    response.headers["X-RateLimit-Limit"] = str(RATE_LIMIT_PER_MINUTE)
+    response.headers["X-RateLimit-Remaining"] = str(max(0, RATE_LIMIT_PER_MINUTE - len(timestamps)))
+    return response
+
+# 3. Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+
+    # Relax CSP for Swagger / ReDoc docs
+    if request.url.path in ("/docs", "/redoc", "/openapi.json"):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "img-src 'self' data: https://fastapi.tiangolo.com;"
+        )
+    else:
+        response.headers["Content-Security-Policy"] = "default-src 'self'"
+
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+    
 _USER_REPO = build_user_repository()
 
 # In-memory registry of active workflow runs' cancellation tokens, keyed
@@ -101,12 +176,30 @@ def require_role(*allowed_roles: Role):
     return checker
 
 
+_SECRET_PATTERNS = [
+    re.compile(r'(api[_-]?key|secret|token|password|auth)\s*[:=]\s*["\']?([^"\'\s&]+)["\']?', re.IGNORECASE),
+    re.compile(r'(AIzaSy[A-Za-z0-9_-]{33})'),
+]
+
+def sanitize_secrets(text: str) -> str:
+    """Mask sensitive keys, tokens, or credentials from audit log entries."""
+    if not text:
+        return text
+    sanitized = text
+    for pattern in _SECRET_PATTERNS:
+        sanitized = pattern.sub(r'\1=***REDACTED***', sanitized)
+    return sanitized
+
+
 def _record_session(wiring, user: User, endpoint: str, request_summary: str, response_summary: str) -> None:
     from domain.session_entities import SessionEvent
     wiring.session_repo.save_event(
         SessionEvent.new(
-            username=user.username, role=user.role.value, endpoint=endpoint,
-            request_summary=request_summary, response_summary=response_summary,
+            username=user.username,
+            role=user.role.value,
+            endpoint=endpoint,
+            request_summary=sanitize_secrets(request_summary),
+            response_summary=sanitize_secrets(response_summary),
         )
     )
 
@@ -114,9 +207,9 @@ def _record_session(wiring, user: User, endpoint: str, request_summary: str, res
 # --- Request/response models -------------------------------------------------
 
 class IngestRequest(BaseModel):
-    source: str
-    doc_type: str
-    raw_text: str
+    source: str = Field(..., max_length=256)
+    doc_type: str = Field(..., max_length=64)
+    raw_text: str = Field(..., max_length=5_000_000)
     data_dir: str = "data"
 
 
@@ -129,7 +222,7 @@ class IngestResponse(BaseModel):
 
 
 class AskRequest(BaseModel):
-    query: str
+    query: str = Field(..., max_length=10_000)
     data_dir: str = "data"
 
 
@@ -148,8 +241,8 @@ class AskResponse(BaseModel):
 
 
 class WorkflowRequest(BaseModel):
-    target_role: str
-    competencies: list[str]
+    target_role: str = Field(..., max_length=128)
+    competencies: list[str] = Field(..., max_length=50)
     data_dir: str = "data"
 
 

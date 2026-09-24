@@ -57,14 +57,17 @@ class AssessCompetencyMatchTool:
         self._uc = answer_use_case
 
     def __call__(self, query: str) -> tuple[bool, Optional[Chunk]]:
-        answer = self._uc.execute(query)
-        if answer.refused or not answer.citations:
+        # Previously this called execute() then retrieve() separately — two
+        # embedding round-trips per competency. Now we call retrieve() once
+        # and apply the same refusal_threshold check directly, halving the
+        # embedding work and keeping well inside the supervisor's step budget.
+        hits = self._uc.retrieve(query)
+        if not hits:
             return False, None
-        top_citation = answer.citations[0]
-        for chunk, _score in self._uc.retrieve(query):
-            if chunk.id == top_citation.chunk_id:
-                return True, chunk
-        return False, None  # citation existed but chunk lookup failed — treat as unmatched, not a crash
+        top_chunk, top_score = hits[0]
+        if top_score < self._uc._cfg.refusal_threshold:
+            return False, None
+        return True, top_chunk
 
 
 class ReadPriorCurriculaTool:

@@ -163,7 +163,7 @@ class GeminiLLMProvider(StreamingLLMProvider):
                         if text:
                             yield text
 
-class GemmaLocalLLMProvider(LLMProvider):
+class GemmaLocalLLMProvider(StreamingLLMProvider):
     """Local Gemma adapter connecting to a locally hosted Gemma instance
     (e.g., gemma-4-e4b) over REST at http://127.0.0.1:1234.
 
@@ -295,6 +295,11 @@ class GemmaLocalLLMProvider(LLMProvider):
         if "content" in body:
             return body["content"]
         raise KeyError(f"Unexpected response format from local Gemma API: {body}")
+
+    def stream_complete(self, system_prompt: str, user_prompt: str) -> Iterable[str]:
+        full_text = self.complete(system_prompt, user_prompt)
+        for chunk in full_text.split(" "):
+            yield chunk + " "
 
     def list_models(self) -> list[dict] | dict:
         url = f"{self._base_url}/api/v1/models"
