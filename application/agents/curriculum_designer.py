@@ -1,39 +1,39 @@
 """
 Curriculum Designer agent (FR-4).
 
-Role: turn a CompetencyGapReport into an ordered ModuleOutline.
-Tool set: search_corpus, read_prior_curricula (both read-only) — this
-agent cannot draft assessment items or write anything; it only ever
-produces the outline.
-Input: CompetencyGapReport (typed contract from Standards Mapper).
-Output: ModuleOutline (typed contract).
-Termination condition: a Module is produced for every matched gap, in
-  order, OR — if there are zero matched gaps to build from — the outline
-  is returned with needs_human_input=True and a reason, rather than
-  fabricating a module out of nothing. This is the "explicit 'needs human
-  input' result if gaps can't be reconciled" case from PLAN.md's design.
+Role: Converts competency gaps into structured module outlines and measurable learning objectives.
+Input: CompetencyGapsContract.
+Output: ModuleOutlineContract (modules with units, learning outcomes, and order).
+Allowed Tools: search_curriculum_templates (read-only).
 """
 from __future__ import annotations
 
 import uuid
+from typing import Union
 
-from domain.workflow_entities import CompetencyGapReport, Module, ModuleOutline
-from application.tools import ReadPriorCurriculaTool, SearchCorpusTool
+from domain.workflow_entities import (
+    CompetencyGapsContract,
+    Module,
+    ModuleOutlineContract,
+)
+from application.tools import SearchCurriculumTemplatesTool
 
 
 class CurriculumDesignerAgent:
     def __init__(
         self,
-        search_corpus: SearchCorpusTool,
-        read_prior_curricula: ReadPriorCurriculaTool,
+        search_curriculum_templates: Union[SearchCurriculumTemplatesTool, callable, None] = None,
+        read_prior_curricula: Union[SearchCurriculumTemplatesTool, callable, None] = None,
+        search_corpus: Union[SearchCurriculumTemplatesTool, callable, None] = None,
     ) -> None:
-        self._search = search_corpus
-        self._read_prior = read_prior_curricula
+        self._search_templates = search_curriculum_templates or search_corpus
+        self._read_prior = read_prior_curricula or self._search_templates
 
-    def execute(self, gap_report: CompetencyGapReport) -> ModuleOutline:
+
+    def execute(self, gap_report: CompetencyGapsContract) -> ModuleOutlineContract:
         matched = [g for g in gap_report.gaps if g.matched]
         if not matched:
-            return ModuleOutline(
+            return ModuleOutlineContract(
                 target_role=gap_report.target_role,
                 modules=(),
                 needs_human_input=True,
@@ -43,16 +43,25 @@ class CurriculumDesignerAgent:
                 ),
             )
 
-        # Read-only lookup against prior curricula, purely to demonstrate
-        # the restricted second tool being exercised; this slice doesn't
-        # yet reorder modules based on what it finds (a real
-        # implementation would use overlap with prior modules to avoid
-        # duplicating existing coverage — tracked as future work).
         for gap in matched:
-            self._read_prior(gap.name, top_k=2)
+            self._search_templates(gap.name, top_k=2)
 
         modules = tuple(
-            Module(id=str(uuid.uuid4()), title=f"Module: {gap.name}", gap_names=(gap.name,), order=i)
+            Module(
+                id=str(uuid.uuid4()),
+                title=f"Module: {gap.name}",
+                gap_names=(gap.name,),
+                order=i,
+                units=[f"Unit 1: Fundamentals of {gap.name}", f"Unit 2: Applied {gap.name}"],
+                learning_outcomes=[
+                    f"Understand core concepts of {gap.name}",
+                    f"Demonstrate practical skill in {gap.name}",
+                ],
+            )
             for i, gap in enumerate(matched)
         )
-        return ModuleOutline(target_role=gap_report.target_role, modules=modules, needs_human_input=False)
+        return ModuleOutlineContract(
+            target_role=gap_report.target_role,
+            modules=modules,
+            needs_human_input=False,
+        )

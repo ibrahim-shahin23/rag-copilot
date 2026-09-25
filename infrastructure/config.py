@@ -122,33 +122,38 @@ def build_user_repository() -> StaticUserRepository:
 
 
 def build_supervisor(wiring: Wiring):
-    """Assembles the FR-4/FR-5 multi-agent pipeline from an existing
-    Wiring. Kept in the composition root, not in interface/cli.py, so the
-    CLI stays a thin presentation layer — it only ever imports use cases
-    and this function, never infrastructure adapters directly."""
+    """Assembles the FR-4/FR-5 multi-agent pipeline from an existing Wiring."""
     from application.agents.curriculum_designer import CurriculumDesignerAgent
     from application.agents.item_generator import ItemGeneratorAgent
     from application.agents.standards_mapper import StandardsMapperAgent
     from application.orchestration.supervisor import Supervisor
     from application.retrieve import AnswerQueryUseCase
-    from application.tools import AssessCompetencyMatchTool, DraftItemTool, ReadPriorCurriculaTool, SearchCorpusTool, SubmitForApprovalTool
+    from application.tools import (
+        DraftItemTool,
+        LookupStandardsTool,
+        PublishAssessmentBankTool,
+        RetrieveCompetencyFrameworkTool,
+        SearchCurriculumTemplatesTool,
+        ValidateDistractorsAutomatedTool,
+    )
 
     answer_uc = AnswerQueryUseCase(
         embedder=wiring.embedder, vector_store=wiring.vector_store,
         keyword_index=wiring.keyword_index, llm=wiring.llm,
     )
-    search_corpus = SearchCorpusTool(answer_uc)
-    assess_competency_match = AssessCompetencyMatchTool(answer_uc)
-    read_prior_curricula = ReadPriorCurriculaTool(answer_uc)
+    lookup_standards = LookupStandardsTool(answer_uc)
+    retrieve_framework = RetrieveCompetencyFrameworkTool(answer_uc)
+    search_templates = SearchCurriculumTemplatesTool(answer_uc)
     draft_item = DraftItemTool(llm=wiring.llm)
-    submit_for_approval = SubmitForApprovalTool(wiring.workflow_repo)
+    validate_distractors = ValidateDistractorsAutomatedTool()
+    publish_bank = PublishAssessmentBankTool(wiring.workflow_repo)
 
     return Supervisor(
-        standards_mapper=StandardsMapperAgent(assess_competency_match),
-        curriculum_designer=CurriculumDesignerAgent(search_corpus, read_prior_curricula),
-        item_generator=ItemGeneratorAgent(search_corpus, draft_item),
-        submit_for_approval=submit_for_approval,
+        standards_mapper=StandardsMapperAgent(lookup_standards, retrieve_framework),
+        curriculum_designer=CurriculumDesignerAgent(search_templates),
+        item_generator=ItemGeneratorAgent(search_templates, draft_item, validate_distractors),
+        submit_for_approval=publish_bank,
         run_repo=wiring.workflow_repo,
         document_repo=wiring.repo,
         fallback_answer_uc=answer_uc,
-    )
+    )

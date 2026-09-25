@@ -9,7 +9,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from domain.workflow_entities import AssessmentItem, ItemApprovalStatus, Run, RunStep
+from domain.workflow_entities import (
+    ApprovalAudit,
+    AssessmentItem,
+    ItemApprovalStatus,
+    Run,
+    RunStep,
+)
 
 
 class RunRepository(ABC):
@@ -31,11 +37,9 @@ class RunRepository(ABC):
 
 
 class ApprovalGateRepository(ABC):
-    """The target of the one write/side-effecting tool (submit_for_approval).
-    An item written here is PENDING and inert — no downstream effect exists
-    for a pending item; only decide() changes that, and every decision is
-    recorded (decided_by, decided_at), which is the audit trail FR-5 asks
-    the approval gate to keep."""
+    """The target of the write/side-effecting tool. An item written here is
+    PENDING and inert — only Lead Instructor approval commits it, and every
+    decision creates an immutable ApprovalAudit record."""
 
     @abstractmethod
     def submit(self, item: AssessmentItem) -> None:
@@ -62,3 +66,11 @@ class ApprovalGateRepository(ABC):
         approved_text: Optional[str] = None,
     ) -> AssessmentItem:
         ...
+
+    @abstractmethod
+    def save_audit(self, audit: ApprovalAudit) -> None:
+        ...
+
+    @abstractmethod
+    def get_audits(self, run_id: str) -> list[ApprovalAudit]:
+        ...

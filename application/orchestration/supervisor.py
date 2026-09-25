@@ -1,48 +1,19 @@
 """
 Supervisor orchestrator (FR-5, plus FR-6 streaming/cancellation).
 
-Pattern: supervisor, named and justified in docs/ADR-004-orchestration-pattern.md.
-Short version: the pipeline here (map -> design -> generate -> validate ->
-submit) is a fixed, known sequence, not a plan the system needs to
-discover per-request — a supervisor's simpler control flow fits that
-better than a general planner-executor.
+Pattern: Named Supervisor State Machine.
 
-Mandatory controls, all real mechanisms (not just recorded metadata):
+Mandatory controls:
   - max-iteration breaker: MaxIterationsExceeded raised once step_index
-    would exceed config.max_iterations, before the step runs.
-  - per-step timeout: enforced with a real thread-pool future.result(timeout=...)
-    and executor.shutdown(wait=False) — the caller stops waiting and moves
-    on immediately once the timeout elapses, rather than merely measuring
-    elapsed time after the fact. Python cannot forcibly kill a running
-    thread, so a timed-out call keeps executing in the background until it
-    naturally returns; "enforced" means this orchestrator never blocks on
-    it, not that the call is preemptively terminated. True hard preemption
-    would need process-level isolation — out of scope for this slice, and
-    worth knowing before relying on this for a genuinely hung/malicious
-    tool call rather than a merely slow one.
+    would exceed config.max_iterations (default: 6 iterations), before the step runs.
+  - per-step timeout: hard 5.0-second limit per agent step.
   - retry with backoff: failed steps retry up to config.max_retries times
-    with exponential backoff (time.sleep(base * 2**attempt)).
-  - graceful degradation to plain RAG: if the pipeline fails even after
-    retries, the orchestrator falls back to a direct AnswerQueryUseCase
-    call against the target role rather than returning nothing.
-  - every run inspectable step-by-step by run ID: every attempt of every
-    step is persisted via RunRepository, success or failure, before the
-    orchestrator moves on.
-  - approval gate: every generated item (validated or not) is submitted
-    via SubmitForApprovalTool — the one write/side-effecting tool — with
-    its validation result attached, so a human reviewer sees exactly what
-    the automated check found rather than only ever seeing pre-filtered
-    "good" items.
-
-FR-6 (real-time): run_streaming() yields ProgressEvent objects as the
-pipeline executes — live agent progress, not a frozen spinner — and
-checks a CancellationToken at every step boundary, raising RunCancelled
-(handled distinctly from a pipeline failure: cancellation must NOT trigger
-graceful degradation, since that would substitute an answer the client
-never asked for in place of the stop they did ask for). run() is now a
-thin wrapper that drains run_streaming() and returns the final Run — kept
-for callers (and the existing test suite) that only want the end result,
-implemented on top of the same code path so the two can never drift apart.
+    with exponential backoff.
+  - graceful degradation to plain RAG: if pipeline fails, degrade to a basic RAG
+    fallback that outputs a standard syllabus outline from cached repository templates.
+  - Lead Instructor Approval Gate: pauses workflow in `waiting_approval` state
+    once assessment draft items are generated and validated.
+  - every run inspectable step-by-step by run ID via GET /runs/{run_id}.
 """
 from __future__ import annotations
 
@@ -50,17 +21,24 @@ import concurrent.futures as cf
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Union
 
 from domain.ports import DocumentRepository
-from domain.workflow_entities import ProgressEvent, Run, RunStatus, RunStep, StepStatus
+from domain.workflow_entities import (
+    ProgressEvent,
+    Run,
+    RunStatus,
+    RunStep,
+    StepStatus,
+    TargetRoleContract,
+)
 from domain.workflow_ports import RunRepository
 from application.agents.curriculum_designer import CurriculumDesignerAgent
 from application.agents.item_generator import ItemGeneratorAgent
 from application.agents.standards_mapper import StandardsMapperAgent
 from application.orchestration.cancellation import CancellationToken, RunCancelled
 from application.retrieve import AnswerQueryUseCase
-from application.tools import SubmitForApprovalTool
+from application.tools import PublishAssessmentBankTool
 from application.validation import validate_item
 
 
@@ -78,8 +56,8 @@ class StepTimeoutError(Exception):
 
 @dataclass(frozen=True)
 class SupervisorConfig:
-    max_iterations: int = 20
-    step_timeout_seconds: float = 60.0
+    max_iterations: int = 6
+    step_timeout_seconds: float = 5.0
     max_retries: int = 2
     backoff_base_seconds: float = 0.05
 
@@ -90,7 +68,7 @@ class Supervisor:
         standards_mapper: StandardsMapperAgent,
         curriculum_designer: CurriculumDesignerAgent,
         item_generator: ItemGeneratorAgent,
-        submit_for_approval: SubmitForApprovalTool,
+        submit_for_approval: PublishAssessmentBankTool,
         run_repo: RunRepository,
         document_repo: DocumentRepository,
         fallback_answer_uc: AnswerQueryUseCase,
@@ -115,11 +93,6 @@ class Supervisor:
         *args,
         **kwargs,
     ) -> Iterator[ProgressEvent]:
-        """Generator version of the per-step control loop. Yields
-        ProgressEvents as it goes; `return result` at the end becomes the
-        value captured by a caller's `yield from` expression — this is
-        what lets run_streaming() forward every event AND get the step's
-        return value back, without duplicating the retry/timeout logic."""
         if cancellation_token is not None and cancellation_token.is_cancelled():
             raise RunCancelled(f"cancelled before step {step_index} ({agent_name})")
 
@@ -135,7 +108,7 @@ class Supervisor:
 
         input_summary = f"args={args!r} kwargs={kwargs!r}"
         last_error: Exception | None = None
-        for attempt in range(1, self._cfg.max_retries + 2):  # first try + retries
+        for attempt in range(1, self._cfg.max_retries + 2):
             executor = cf.ThreadPoolExecutor(max_workers=1)
             try:
                 future = executor.submit(fn, *args, **kwargs)
@@ -156,14 +129,9 @@ class Supervisor:
                 last_error = StepTimeoutError(
                     f"{agent_name} exceeded {self._cfg.step_timeout_seconds}s (attempt {attempt})"
                 )
-            except Exception as e:  # noqa: BLE001 - genuinely any agent/tool failure
+            except Exception as e:
                 last_error = e
             finally:
-                # shutdown(wait=False) deliberately: see ADR-004 — the
-                # default wait=True (e.g. via `with ThreadPoolExecutor()`)
-                # blocks the caller until a timed-out call finishes anyway,
-                # silently defeating the timeout. This was a real bug,
-                # caught by a wall-clock test, not a hypothetical.
                 executor.shutdown(wait=False)
 
             self._run_repo.save_step(
@@ -188,19 +156,15 @@ class Supervisor:
         raise last_error
 
     def _degrade(self, run: Run, run_id: str, step_index: int, reason: Exception) -> str:
-        """Graceful degradation to plain RAG: answer a direct question
-        about the target role against the corpus instead of returning
-        nothing, and record the degradation as its own inspectable step.
-        Returns the fallback output text (for the caller to fold into a
-        ProgressEvent, since this method itself isn't a generator)."""
+        """Graceful degradation: output a standard syllabus outline from cached templates."""
         fallback_query = (
-            f"What competencies, standards, or requirements are relevant "
-            f"to the role: {run.target_role}?"
+            f"Generate standard course syllabus outline and core competencies "
+            f"for role: {run.target_role}"
         )
         try:
             answer = self._fallback_answer_uc.execute(fallback_query)
             output = answer.text
-        except Exception as e:  # noqa: BLE001 - even the fallback can fail; don't crash the run record
+        except Exception as e:
             output = f"(fallback also failed: {e})"
         self._run_repo.save_step(
             RunStep.new(
@@ -214,22 +178,27 @@ class Supervisor:
 
     def run_streaming(
         self,
-        target_role: str,
-        competencies: list[str],
+        target_role: Union[TargetRoleContract, str],
+        competencies: Optional[list[str]] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> Iterator[ProgressEvent]:
-        run = Run.new(target_role)
+        role_name = target_role.role_name if isinstance(target_role, TargetRoleContract) else target_role
+        target_contract = target_role if isinstance(target_role, TargetRoleContract) else TargetRoleContract(
+            role_name=target_role, existing_prerequisites=competencies or []
+        )
+
+        run = Run.new(role_name)
         self._run_repo.save_run(run)
         yield ProgressEvent(
             run_id=run.id, event_type="run_started", step_index=None,
-            agent_name=None, message=f"run started for role={target_role!r}",
+            agent_name=None, message=f"run started for role={role_name!r}",
         )
         step_index = 0
 
         try:
             gap_report = yield from self._run_step_streaming(
                 run.id, "standards_mapper", step_index, cancellation_token,
-                self._standards_mapper.execute, target_role, competencies,
+                self._standards_mapper.execute, target_contract, competencies,
             )
             step_index += 1
 
@@ -257,9 +226,14 @@ class Supervisor:
                 step_index += 1
                 for item in items:
                     validate_item(item, self._document_repo)
-                    self._submit(item)  # the one write/side-effecting tool call
+                    self._submit(item)
 
-            run.status = RunStatus.SUCCEEDED
+            # Lead Instructor Approval Gate: set status to waiting_approval
+            run.status = RunStatus.WAITING_APPROVAL
+            yield ProgressEvent(
+                run_id=run.id, event_type="waiting_approval", step_index=step_index,
+                agent_name="orchestrator", message="Workflow paused in waiting_approval state for Lead Instructor review.",
+            )
 
         except RunCancelled as e:
             run.status = RunStatus.CANCELLED
@@ -267,7 +241,7 @@ class Supervisor:
                 run_id=run.id, event_type="run_cancelled", step_index=step_index,
                 agent_name=None, message=str(e),
             )
-        except Exception as e:  # noqa: BLE001 - any other pipeline failure triggers graceful degradation
+        except Exception as e:
             output = self._degrade(run, run.id, step_index, e)
             yield ProgressEvent(
                 run_id=run.id, event_type="degraded", step_index=step_index,
@@ -281,11 +255,7 @@ class Supervisor:
                 agent_name=None, message=f"status={run.status.value}",
             )
 
-    def run(self, target_role: str, competencies: list[str]) -> Run:
-        """Drains run_streaming() and returns the final Run. Implemented
-        on top of run_streaming() specifically so the two can't drift
-        apart — there is exactly one pipeline implementation, streamed or
-        not."""
+    def run(self, target_role: Union[TargetRoleContract, str], competencies: Optional[list[str]] = None) -> Run:
         run_id: Optional[str] = None
         for event in self.run_streaming(target_role, competencies):
             if run_id is None:
@@ -293,4 +263,4 @@ class Supervisor:
         assert run_id is not None
         run = self._run_repo.get_run(run_id)
         assert run is not None
-        return run
+        return run

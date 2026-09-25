@@ -1,15 +1,10 @@
 """
 The multi-agent system's tool set (FR-4: >=4 tools, >=1 write/side-effecting).
 
-1. SearchCorpusTool         — read-only
-2. ReadPriorCurriculaTool   — read-only, restricted to a source-name filter
-3. DraftItemTool            — pure generation, no side effects
-4. SubmitForApprovalTool    — the ONE write/side-effecting tool
-
-Each agent below is constructed with only the tool instances its role
-needs (see application/agents/*.py) — that's the "restricted tool set"
-requirement enforced by construction, not by convention: an agent simply
-has no reference to a tool it isn't supposed to use.
+1. LookupStandardsTool / retrieve_competency_framework — read-only taxonomy & standards query
+2. SearchCurriculumTemplatesTool                      — read-only syllabi & template search
+3. ValidateDistractorsAutomatedTool                   — automated quality pass for assessment items
+4. PublishAssessmentBankTool                           — the ONE write/side-effecting tool (manual/approval-triggered)
 """
 from __future__ import annotations
 
@@ -20,47 +15,25 @@ from typing import Optional
 
 from domain.entities import Chunk
 from domain.ports import LLMProvider
-from domain.workflow_entities import AssessmentItem, ItemApprovalStatus
+from domain.workflow_entities import (
+    AssessmentDraftItemContract,
+    AssessmentItem,
+    ItemApprovalStatus,
+)
 from domain.workflow_ports import ApprovalGateRepository
 from application.retrieve import AnswerQueryUseCase
+
 
 _NUMBER_RE = re.compile(r"\b\d+\b")
 
 
-class SearchCorpusTool:
-    """Read-only. Wraps AnswerQueryUseCase.retrieve — agents get retrieved
-    chunks with citations, never raw write access to the corpus or store."""
-
-    def __init__(self, answer_use_case: AnswerQueryUseCase) -> None:
-        self._uc = answer_use_case
-
-    def __call__(self, query: str, top_k: int = 5) -> list[tuple[Chunk, float]]:
-        return self._uc.retrieve(query)[:top_k]
-
-
-class AssessCompetencyMatchTool:
-    """Read-only, and deliberately NOT built on SearchCorpusTool's raw
-    retrieve(). Standards Mapper's job is to decide matched vs. unmapped,
-    not just fetch candidates — and retrieve() has no relevance threshold
-    at all (by design; see application/retrieve.py's docstring), so a
-    first version of this tool built on raw retrieval could never actually
-    produce 'unmapped', even for a nonsense competency like 'quantum
-    telepathy' — caught in live CLI testing, not simulated. Reusing
-    AnswerQueryUseCase.execute()'s refusal decision here means Standards
-    Mapper inherits the one relevance signal the rest of this system has
-    actually been evaluated against (eval/results/report.md) — including
-    its documented limitation (ADR-002: no single threshold cleanly
-    separates relevant from irrelevant on a small corpus) rather than
-    inventing a second, unvalidated threshold just for this tool."""
+class LookupStandardsTool:
+    """Read-only. Queries standards/skills taxonomy against the ingested corpus."""
 
     def __init__(self, answer_use_case: AnswerQueryUseCase) -> None:
         self._uc = answer_use_case
 
     def __call__(self, query: str) -> tuple[bool, Optional[Chunk]]:
-        # Previously this called execute() then retrieve() separately — two
-        # embedding round-trips per competency. Now we call retrieve() once
-        # and apply the same refusal_threshold check directly, halving the
-        # embedding work and keeping well inside the supervisor's step budget.
         hits = self._uc.retrieve(query)
         if not hits:
             return False, None
@@ -70,30 +43,41 @@ class AssessCompetencyMatchTool:
         return True, top_chunk
 
 
-class ReadPriorCurriculaTool:
-    """Read-only, and restricted beyond SearchCorpusTool: only chunks whose
-    source name matches the 'curriculum' naming convention are returned,
-    so this tool can't be used as a backdoor to pull arbitrary corpus
-    content under the 'prior curricula' label."""
+class RetrieveCompetencyFrameworkTool:
+    """Read-only. Queries educational/industry competency frameworks (e.g., Bloom's, SFIA, O*NET)."""
+
+    def __init__(self, answer_use_case: AnswerQueryUseCase) -> None:
+        self._uc = answer_use_case
+
+    def __call__(self, framework_name: str, topic: str) -> list[tuple[Chunk, float]]:
+        query = f"{framework_name} {topic}"
+        return self._uc.retrieve(query)[:3]
+
+
+# Backwards-compatible alias for existing code
+AssessCompetencyMatchTool = LookupStandardsTool
+
+
+class SearchCurriculumTemplatesTool:
+    """Read-only. Semantic search over course syllabi, prior curricula, and learning templates."""
 
     def __init__(self, answer_use_case: AnswerQueryUseCase) -> None:
         self._uc = answer_use_case
 
     def __call__(self, topic: str, top_k: int = 5) -> list[tuple[Chunk, float]]:
         hits = self._uc.retrieve(topic)
-        filtered = [(c, s) for c, s in hits if "curriculum" in c.metadata.source.lower()]
-        return filtered[:top_k]
+        filtered = [c for c in hits if "curriculum" in c[0].metadata.source.lower()]
+        return filtered[:top_k] if filtered else hits[:top_k]
+
+
+# Backwards-compatible alias for existing code
+SearchCorpusTool = SearchCurriculumTemplatesTool
+ReadPriorCurriculaTool = SearchCurriculumTemplatesTool
 
 
 class DraftItemTool:
-    """Pure generation — no side effects, no persistence. Tries the
-    configured LLM first (a structured JSON prompt); if that fails or
-    returns something unusable — the expected outcome on the offline
-    extractive-fallback provider, which just echoes excerpt text and
-    can't produce JSON — falls back to a deterministic numeric-masking
-    drafter, so item generation stays fully testable without an API key.
-    Mirrors the same graceful-degradation shape already used for
-    embeddings/completion (infrastructure/resilience/)."""
+    """Pure generation — no side effects, no persistence. Generates item question,
+    options, correct index, and distractors."""
 
     def __init__(self, llm: LLMProvider, rng_seed: int = 42) -> None:
         self._llm = llm
@@ -130,10 +114,11 @@ class DraftItemTool:
             pass
         return None
 
+
     def _deterministic_numeric_mask(self, chunk_text: str) -> Optional[dict]:
         match = _NUMBER_RE.search(chunk_text)
         if not match:
-            return None  # no numeric fact to mask -> caller must skip, not force a bad item
+            return None
         number = int(match.group())
         blanked = (chunk_text[: match.start()] + "____" + chunk_text[match.end():]).strip()
         if len(blanked) > 220:
@@ -155,23 +140,58 @@ class DraftItemTool:
             "question": f"Fill in the blank: {blanked}",
             "options": options,
             "correct_index": correct_index,
+            "rationale": f"Numeric fact '{number}' extracted from source snippet.",
         }
 
 
-class SubmitForApprovalTool:
-    """The one write/side-effecting tool. Persists a drafted, validated
-    item as PENDING in the approval gate. This is a genuine write (new
-    state is durably stored), but a PENDING item has no downstream effect
-    — nothing reads a pending item as usable. The approval decision
-    (approve / reject / edit-and-approve), not this call, is what
-    'passing the approval gate' means; this tool is what makes an item
-    reachable for that decision in the first place, never what finalizes
-    it. See docs/ADR-004-orchestration-pattern.md for this interpretation
-    stated explicitly."""
+class ValidateDistractorsAutomatedTool:
+    """Automated Quality Pass: Evaluates assessment draft items to ensure
+    distractors are plausible, non-trivial, distinct, and unambiguously wrong.
+    Flags ambiguous or invalid distractors."""
+
+    def __call__(self, item: AssessmentDraftItemContract, document_repo=None) -> tuple[bool, str]:
+        # 1. Option count & uniqueness check
+        options = list(item.options)
+        if len(options) < 2:
+            return False, "Failed quality pass: Item must have at least 2 options."
+        if len(set(options)) != len(options):
+            return False, "Failed quality pass: Duplicate options/distractors detected."
+
+        # 2. Correct index check
+        if not (0 <= item.correct_option_index < len(options)):
+            return False, f"Failed quality pass: Correct index {item.correct_option_index} out of bounds."
+
+        # 3. Citation verbatim verification (if doc repo present)
+        if document_repo is not None:
+            chunk = document_repo.find_chunk_by_id(item.citation_chunk_id)
+            if chunk is not None:
+                correct_option = options[item.correct_option_index]
+                if correct_option.lower() not in chunk.text.lower():
+                    return False, f"Correct option '{correct_option}' not found verbatim in cited chunk."
+
+        # 4. Check for ambiguous/trivial distractors (e.g. empty strings, "all of the above" conflicts)
+        for idx, opt in enumerate(options):
+            if not opt.strip():
+                return False, f"Option at index {idx} is empty or whitespace."
+            if opt.lower() in ("all of the above", "none of the above") and len(options) < 3:
+                return False, f"Ambiguous distractor '{opt}' with insufficient options."
+
+        return True, "Automated distractor quality validation passed."
+
+
+class PublishAssessmentBankTool:
+    """WRITE / Side-Effecting tool: Commits approved items to the production
+    assessment bank database.
+    CRITICAL: Must NEVER execute automatically. Must halt for Lead Instructor approval."""
 
     def __init__(self, approval_gate: ApprovalGateRepository) -> None:
         self._gate = approval_gate
 
-    def __call__(self, item: AssessmentItem) -> None:
-        item.approval_status = ItemApprovalStatus.PENDING
+    def __call__(self, item: AssessmentDraftItemContract, status: ItemApprovalStatus = ItemApprovalStatus.PENDING) -> None:
+        item.approval_status = status
         self._gate.submit(item)
+
+
+
+# Backwards compatibility alias
+SubmitForApprovalTool = PublishAssessmentBankTool

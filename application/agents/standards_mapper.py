@@ -1,51 +1,77 @@
 """
 Standards Mapper agent (FR-4).
 
-Role: map a target role's required competencies against the ingested
-standards corpus.
-Tool set: assess_competency_match only (read-only) — this agent has no
-reference to any other tool, so it cannot draft items, submit anything,
-or read prior-curricula content even if it wanted to.
-Input: target role (str) + the list of competencies that role requires.
-  Role-to-competency taxonomies are a real product surface on their own;
-  out of scope for this slice, so the competency list is supplied by the
-  caller rather than derived from anywhere.
-Output: CompetencyGapReport (typed contract, domain/workflow_entities.py).
-Termination condition: every competency in the input list ends up with
-  exactly one CompetencyGap in the output — matched (with a citation) or
-  explicitly matched=False ("unmapped"). The loop below makes silently
-  dropping one structurally impossible, not just a convention to remember.
+Role: Ingests the target professional/academic role and analyzes competency gaps
+against educational/industry standards (e.g., Bloom’s taxonomy, SFIA, O*NET).
+Input: TargetRoleContract (role_name, target_seniority, existing_prerequisites).
+Output: CompetencyGapsContract (target_role, mapped_standards, gaps, gap_areas).
+Allowed Tools: lookup_standards, retrieve_competency_framework (read-only).
 """
 from __future__ import annotations
 
-from domain.workflow_entities import CompetencyGap, CompetencyGapReport
-from application.tools import AssessCompetencyMatchTool
+from typing import Optional, Union
+
+from domain.workflow_entities import (
+    CompetencyGap,
+    CompetencyGapsContract,
+    TargetRoleContract,
+)
+from application.tools import LookupStandardsTool, RetrieveCompetencyFrameworkTool
 
 
 class StandardsMapperAgent:
-    def __init__(self, assess_competency_match: AssessCompetencyMatchTool) -> None:
-        self._assess = assess_competency_match
+    def __init__(
+        self,
+        lookup_standards: Union[LookupStandardsTool, callable, None] = None,
+        retrieve_competency_framework: Optional[RetrieveCompetencyFrameworkTool] = None,
+        assess_competency_match: Union[LookupStandardsTool, callable, None] = None,
+    ) -> None:
+        self._lookup = lookup_standards or assess_competency_match
+        self._framework = retrieve_competency_framework
 
-    def execute(self, target_role: str, competencies: list[str]) -> CompetencyGapReport:
+
+    def execute(
+        self,
+        target_role_input: Union[TargetRoleContract, str],
+        competencies: Optional[list[str]] = None,
+    ) -> CompetencyGapsContract:
+        if isinstance(target_role_input, TargetRoleContract):
+            target_role = target_role_input.role_name
+            comps = competencies if competencies is not None else target_role_input.existing_prerequisites
+        else:
+            target_role = target_role_input
+            comps = competencies or []
+
         gaps: list[CompetencyGap] = []
-        for competency in competencies:
-            matched, chunk = self._assess(competency)
+        mapped_standards = []
+        gap_areas = []
+
+        for competency in comps:
+            matched, chunk = self._lookup(competency)
             if matched and chunk is not None:
-                gaps.append(
-                    CompetencyGap(
-                        name=competency,
-                        description=chunk.text[:200],
-                        citation_chunk_ids=(chunk.id,),
-                        matched=True,
-                    )
+                gap = CompetencyGap(
+                    name=competency,
+                    description=chunk.text[:200],
+                    citation_chunk_ids=(chunk.id,),
+                    matched=True,
+                    framework_standard="SFIA / Bloom's Taxonomy",
                 )
+                gaps.append(gap)
+                mapped_standards.append({"competency": competency, "standard": "Bloom's/SFIA", "chunk_id": chunk.id})
             else:
-                gaps.append(
-                    CompetencyGap(
-                        name=competency,
-                        description="No matching standard found in the ingested corpus",
-                        citation_chunk_ids=(),
-                        matched=False,
-                    )
+                gap = CompetencyGap(
+                    name=competency,
+                    description="No matching standard found in the ingested corpus",
+                    citation_chunk_ids=(),
+                    matched=False,
+                    framework_standard=None,
                 )
-        return CompetencyGapReport(target_role=target_role, gaps=tuple(gaps))
+                gaps.append(gap)
+                gap_areas.append(competency)
+
+        return CompetencyGapsContract(
+            target_role=target_role,
+            mapped_standards=mapped_standards,
+            gaps=tuple(gaps),
+            gap_areas=gap_areas,
+        )

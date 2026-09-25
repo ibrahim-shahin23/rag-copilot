@@ -479,15 +479,210 @@ def cancel_workflow(run_id: str, user: User = Depends(require_role(Role.CONTRIBU
     return {"run_id": run_id, "cancel_requested": True}
 
 
+@app.get("/runs/{run_id}")
+def inspect_run(
+    run_id: str, data_dir: str = "data", user: User = Depends(require_role(Role.REVIEWER, Role.CONTRIBUTOR)),
+) -> dict:
+    """Run Inspection endpoint (FR-5): Every execution step audited and queryable via GET /runs/{run_id}."""
+    wiring = build_wiring(data_dir)
+    run = wiring.workflow_repo.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"No run found with id {run_id!r}")
+    steps = wiring.workflow_repo.get_steps(run_id)
+    items = wiring.workflow_repo.list_all()
+    audits = wiring.workflow_repo.get_audits(run_id)
+
+    _record_session(wiring, user, "GET /runs/{run_id}", f"run_id={run_id}", f"status={run.status.value}")
+    return {
+        "run_id": run.id,
+        "target_role": run.target_role,
+        "status": run.status.value,
+        "started_at": run.started_at.isoformat(),
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+        "steps": [
+            {
+                "step_index": s.step_index,
+                "agent_name": s.agent_name,
+                "status": s.status.value,
+                "attempt": s.attempt,
+                "input_summary": s.input_summary,
+                "output_summary": s.output_summary,
+                "error": s.error,
+            }
+            for s in steps
+        ],
+        "items": [
+            {
+                "id": i.id,
+                "module_id": i.module_id,
+                "question": i.question,
+                "options": list(i.options),
+                "correct_option_index": i.correct_option_index,
+                "correct_key": i.correct_key,
+                "rationale": i.rationale,
+                "validation_passed": i.validation_passed,
+                "validation_notes": i.validation_notes,
+                "approval_status": i.approval_status.value,
+            }
+            for i in items
+        ],
+        "approval_audits": [
+            {
+                "id": a.id,
+                "run_id": a.run_id,
+                "item_id": a.item_id,
+                "reviewer_id": a.reviewer_id,
+                "decision": a.decision,
+                "feedback": a.feedback,
+                "original_draft": a.original_draft,
+                "modified_content": a.modified_content,
+                "timestamp": a.timestamp.isoformat(),
+            }
+            for a in audits
+        ],
+    }
+
+
+class InstructorApproveRequest(BaseModel):
+    feedback: Optional[str] = None
+    data_dir: str = "data"
+
+
+class InstructorRejectRequest(BaseModel):
+    feedback: str = "Rejected by Lead Instructor"
+    data_dir: str = "data"
+
+
+class InstructorEditApproveRequest(BaseModel):
+    edited_items: Optional[list[dict]] = None
+    edited_text: Optional[str] = None
+    feedback: Optional[str] = None
+    data_dir: str = "data"
+
+
+@app.post("/runs/{run_id}/approve")
+def approve_run(
+    run_id: str, payload: InstructorApproveRequest, user: User = Depends(require_role(Role.REVIEWER)),
+) -> dict:
+    """Lead Instructor Approval Gate: Publishes items as proposed."""
+    wiring = build_wiring(payload.data_dir)
+    run = wiring.workflow_repo.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
+
+    pending_items = wiring.workflow_repo.list_pending()
+    original_drafts = []
+    for item in pending_items:
+        original_drafts.append({
+            "id": item.id, "question": item.question, "options": list(item.options),
+            "correct_option_index": item.correct_option_index, "correct_key": item.correct_key,
+        })
+        wiring.workflow_repo.decide(
+            item_id=item.id, decision=ItemApprovalStatus.APPROVED, decided_by=user.username,
+        )
+
+    from domain.workflow_entities import ApprovalAudit, RunStatus
+    audit = ApprovalAudit.new(
+        run_id=run_id, reviewer_id=user.username, decision="approve",
+        original_draft=json.dumps(original_drafts), feedback=payload.feedback,
+    )
+    wiring.workflow_repo.save_audit(audit)
+
+    run.status = RunStatus.SUCCEEDED
+    run.finished_at = time.time() if isinstance(run.finished_at, float) else None
+    wiring.workflow_repo.save_run(run)
+
+    _record_session(wiring, user, "POST /runs/approve", f"run_id={run_id}", "status=succeeded")
+    return {"run_id": run_id, "status": run.status.value, "approved_items_count": len(pending_items), "audit_id": audit.id}
+
+
+@app.post("/runs/{run_id}/reject")
+def reject_run(
+    run_id: str, payload: InstructorRejectRequest, user: User = Depends(require_role(Role.REVIEWER)),
+) -> dict:
+    """Lead Instructor Approval Gate: Rejects items back to draft with instructor feedback."""
+    wiring = build_wiring(payload.data_dir)
+    run = wiring.workflow_repo.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
+
+    pending_items = wiring.workflow_repo.list_pending()
+    original_drafts = []
+    for item in pending_items:
+        original_drafts.append({
+            "id": item.id, "question": item.question, "options": list(item.options),
+            "correct_option_index": item.correct_option_index, "correct_key": item.correct_key,
+        })
+        wiring.workflow_repo.decide(
+            item_id=item.id, decision=ItemApprovalStatus.REJECTED, decided_by=user.username,
+        )
+
+    from domain.workflow_entities import ApprovalAudit, RunStatus
+    audit = ApprovalAudit.new(
+        run_id=run_id, reviewer_id=user.username, decision="reject",
+        original_draft=json.dumps(original_drafts), feedback=payload.feedback,
+    )
+    wiring.workflow_repo.save_audit(audit)
+
+    run.status = RunStatus.REJECTED
+    wiring.workflow_repo.save_run(run)
+
+    _record_session(wiring, user, "POST /runs/reject", f"run_id={run_id}", "status=rejected")
+    return {"run_id": run_id, "status": run.status.value, "feedback": payload.feedback, "audit_id": audit.id}
+
+
+@app.post("/runs/{run_id}/edit-and-approve")
+def edit_and_approve_run(
+    run_id: str, payload: InstructorEditApproveRequest, user: User = Depends(require_role(Role.REVIEWER)),
+) -> dict:
+    """Lead Instructor Approval Gate: Allows Lead Instructor to fix questions, distractors, or keys before final commit."""
+    wiring = build_wiring(payload.data_dir)
+    run = wiring.workflow_repo.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
+
+    pending_items = wiring.workflow_repo.list_pending()
+    original_drafts = []
+    modified_contents = []
+
+    for idx, item in enumerate(pending_items):
+        original_drafts.append({
+            "id": item.id, "question": item.question, "options": list(item.options),
+            "correct_option_index": item.correct_option_index, "correct_key": item.correct_key,
+        })
+        edited_text = payload.edited_text
+        if payload.edited_items and idx < len(payload.edited_items):
+            edited_info = payload.edited_items[idx]
+            edited_text = json.dumps(edited_info)
+            modified_contents.append(edited_info)
+        elif edited_text:
+            modified_contents.append({"approved_text": edited_text})
+
+        wiring.workflow_repo.decide(
+            item_id=item.id, decision=ItemApprovalStatus.EDITED_AND_APPROVED,
+            decided_by=user.username, approved_text=edited_text or "Edited by Lead Instructor",
+        )
+
+    from domain.workflow_entities import ApprovalAudit, RunStatus
+    audit = ApprovalAudit.new(
+        run_id=run_id, reviewer_id=user.username, decision="edit-and-approve",
+        original_draft=json.dumps(original_drafts),
+        modified_content=json.dumps(modified_contents) if modified_contents else None,
+        feedback=payload.feedback,
+    )
+    wiring.workflow_repo.save_audit(audit)
+
+    run.status = RunStatus.SUCCEEDED
+    wiring.workflow_repo.save_run(run)
+
+    _record_session(wiring, user, "POST /runs/edit-and-approve", f"run_id={run_id}", "status=succeeded")
+    return {"run_id": run_id, "status": run.status.value, "audit_id": audit.id}
+
+
 @app.get("/workflow/trace/{run_id}", response_model=TraceResponse)
 def workflow_trace(
     run_id: str, data_dir: str = "data", user: User = Depends(require_role(Role.REVIEWER)),
 ) -> TraceResponse:
-    """REVIEWER-only: a run's step-by-step trace is oversight information,
-    consistent with REVIEWER being the audit/approval role elsewhere in
-    this file — a CONTRIBUTOR who started a run doesn't get to inspect its
-    internals through this endpoint (they see the summary from
-    /workflow/run's response instead)."""
     wiring = build_wiring(data_dir)
     run = wiring.workflow_repo.get_run(run_id)
     if run is None:
@@ -536,9 +731,6 @@ def list_approvals(
 def decide_approval(
     item_id: str, payload: ApprovalDecisionRequest, user: User = Depends(require_role(Role.REVIEWER)),
 ) -> dict:
-    """REVIEWER-only, deliberately: a CONTRIBUTOR approving items their
-    own workflow run generated would defeat the point of a
-    human-in-the-loop gate (FR-4's design intent, see PLAN.md §4)."""
     decision_map = {
         "approve": ItemApprovalStatus.APPROVED,
         "reject": ItemApprovalStatus.REJECTED,
@@ -555,6 +747,13 @@ def decide_approval(
             item_id=item_id, decision=decision_map[payload.decision],
             decided_by=user.username, approved_text=payload.edited_text,
         )
+        from domain.workflow_entities import ApprovalAudit
+        audit = ApprovalAudit.new(
+            run_id="single-item", item_id=item_id, reviewer_id=user.username,
+            decision=payload.decision, original_draft=item.question,
+            modified_content=payload.edited_text,
+        )
+        wiring.workflow_repo.save_audit(audit)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -573,8 +772,6 @@ def decide_approval(
 
 @app.get("/sessions", response_model=list[SessionEventResponse])
 def list_sessions(data_dir: str = "data", user: User = Depends(get_current_user)) -> list[SessionEventResponse]:
-    """Any authenticated user can call this — a CONTRIBUTOR sees only
-    their own history; a REVIEWER (the oversight role) sees everyone's."""
     wiring = build_wiring(data_dir)
     username_filter = None if user.role == Role.REVIEWER else user.username
     events = wiring.session_repo.list_events(username=username_filter)
@@ -585,4 +782,4 @@ def list_sessions(data_dir: str = "data", user: User = Depends(get_current_user)
             timestamp=e.timestamp.isoformat(),
         )
         for e in events
-    ]
+    ]
