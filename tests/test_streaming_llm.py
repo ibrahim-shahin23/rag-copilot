@@ -30,9 +30,11 @@ def test_extractive_stream_complete_yields_multiple_chunks_for_long_text():
 # --- GeminiLLMProvider.stream_complete ---
 
 def test_gemini_stream_complete_raises_without_api_key():
-    provider = GeminiLLMProvider(api_key=None)
-    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
-        list(provider.stream_complete("sys", "user"))
+    with patch.dict("os.environ", {}, clear=True):
+        provider = GeminiLLMProvider(api_key=None)
+        with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+            list(provider.stream_complete("sys", "user"))
+
 
 
 def test_gemini_stream_complete_parses_sse_response():

@@ -196,8 +196,37 @@ def test_workflow_run_over_http(client, tmp_data_dir):
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] in ("succeeded", "degraded")
+    assert body["status"] in ("waiting_approval", "succeeded", "degraded")
     assert len(body["steps"]) > 0
+
+
+def test_lead_instructor_approval_endpoints_over_http(client, tmp_data_dir):
+    # 1. Start workflow run -> reaches waiting_approval
+    run_resp = client.post(
+        "/workflow/run",
+        json={"target_role": "RAG Engineer", "competencies": ["hybrid retrieval"], "data_dir": tmp_data_dir},
+        headers=_auth(CONTRIBUTOR_KEY),
+    )
+    run_id = run_resp.json()["run_id"]
+
+    # 2. Inspect run via GET /runs/{run_id}
+    inspect_resp = client.get(f"/runs/{run_id}", params={"data_dir": tmp_data_dir}, headers=_auth(REVIEWER_KEY))
+    assert inspect_resp.status_code == 200
+    inspect_body = inspect_resp.json()
+    assert inspect_body["run_id"] == run_id
+    assert inspect_body["status"] in ("waiting_approval", "succeeded", "degraded")
+    assert len(inspect_body["steps"]) > 0
+
+    # 3. Lead Instructor approves run via POST /runs/{run_id}/approve
+    approve_resp = client.post(
+        f"/runs/{run_id}/approve",
+        json={"feedback": "Looks great!", "data_dir": tmp_data_dir},
+        headers=_auth(REVIEWER_KEY),
+    )
+    assert approve_resp.status_code == 200
+    approve_body = approve_resp.json()
+    assert approve_body["status"] == "succeeded"
+    assert "audit_id" in approve_body
 
 
 def test_workflow_trace_over_http_reviewer_only(client, tmp_data_dir):
@@ -215,6 +244,7 @@ def test_workflow_trace_over_http_reviewer_only(client, tmp_data_dir):
     body = trace_resp.json()
     assert body["run_id"] == run_id
     assert len(body["steps"]) > 0
+
 
 
 def test_workflow_trace_404_for_unknown_run(client, tmp_data_dir):

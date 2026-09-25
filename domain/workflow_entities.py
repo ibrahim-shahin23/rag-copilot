@@ -1,58 +1,90 @@
 """
 Domain entities for the multi-agent workflow (FR-4/FR-5). Same rule as
-domain/entities.py: plain dataclasses, zero dependency on any LLM SDK,
-vector-store SDK, web framework, or the agent/orchestration code itself.
-These are the typed contracts FR-4 requires agents to communicate through
-— never free-form text between agents.
+domain/entities.py: zero dependency on any LLM SDK, vector-store SDK,
+or web framework.
+These are the typed Pydantic contracts FR-4 requires agents to communicate through
+— strictly no free-form text handoffs between agents.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 import uuid
+from pydantic import BaseModel, Field, field_validator
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# --- Standards Mapper output -------------------------------------------------
+# --- Input Contract: Target Role ---
 
-@dataclass(frozen=True)
-class CompetencyGap:
+class TargetRoleContract(BaseModel):
+    role_name: str
+    target_seniority: str = "Mid"
+    existing_prerequisites: list[str] = Field(default_factory=list)
+
+
+# --- Standards Mapper output: Competency Gaps Contract -----------------------
+
+class CompetencyGap(BaseModel):
     name: str
     description: str
-    citation_chunk_ids: tuple[str, ...]  # empty tuple if unmapped
-    matched: bool  # False = explicitly flagged unmapped, never silently dropped
+    citation_chunk_ids: tuple[str, ...] = Field(default_factory=tuple)
+    matched: bool = True
+    framework_standard: Optional[str] = None
 
 
-@dataclass(frozen=True)
-class CompetencyGapReport:
+class CompetencyGapsContract(BaseModel):
     target_role: str
-    gaps: tuple[CompetencyGap, ...]
+    mapped_standards: list[dict] = Field(default_factory=list)
+    gaps: tuple[CompetencyGap, ...] = Field(default_factory=tuple)
+    gap_areas: list[str] = Field(default_factory=list)
+
+    @field_validator("target_role", mode="before")
+    @classmethod
+    def _coerce_target_role(cls, v):
+        if hasattr(v, "role_name"):
+            return v.role_name
+        return str(v)
 
 
-# --- Curriculum Designer output ----------------------------------------------
+# Backwards compatibility alias
+CompetencyGapReport = CompetencyGapsContract
 
-@dataclass(frozen=True)
-class Module:
+
+# --- Curriculum Designer output: Module Outline Contract --------------------
+
+class Module(BaseModel):
     id: str
     title: str
-    gap_names: tuple[str, ...]
-    order: int
+    gap_names: tuple[str, ...] = Field(default_factory=tuple)
+    order: int = 0
+    units: list[str] = Field(default_factory=list)
+    learning_outcomes: list[str] = Field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class ModuleOutline:
+class ModuleOutlineContract(BaseModel):
     target_role: str
-    modules: tuple[Module, ...]
+    modules: tuple[Module, ...] = Field(default_factory=tuple)
     needs_human_input: bool = False
     reason: Optional[str] = None
 
+    @field_validator("target_role", mode="before")
+    @classmethod
+    def _coerce_target_role(cls, v):
+        if hasattr(v, "role_name"):
+            return v.role_name
+        return str(v)
 
-# --- Item Generator output ---------------------------------------------------
+
+
+# Backwards compatibility alias
+ModuleOutline = ModuleOutlineContract
+
+
+# --- Item Generator output: Assessment Draft Contract ----------------------
 
 class ItemApprovalStatus(str, Enum):
     PENDING = "pending"
@@ -61,17 +93,18 @@ class ItemApprovalStatus(str, Enum):
     EDITED_AND_APPROVED = "edited_and_approved"
 
 
-@dataclass
-class AssessmentItem:
+class AssessmentDraftItemContract(BaseModel):
     id: str
     module_id: str
     question: str
     options: tuple[str, ...]
     correct_option_index: int
+    correct_key: str = ""
+    rationale: str = ""
     citation_chunk_id: str
     citation_source: str
-    validation_passed: bool
-    validation_notes: str
+    validation_passed: bool = False
+    validation_notes: str = "not yet validated"
     approval_status: ItemApprovalStatus = ItemApprovalStatus.PENDING
     approved_text: Optional[str] = None  # populated only on edit-and-approve
     decided_by: Optional[str] = None
@@ -85,13 +118,17 @@ class AssessmentItem:
         correct_option_index: int,
         citation_chunk_id: str,
         citation_source: str,
-    ) -> "AssessmentItem":
-        return AssessmentItem(
+        rationale: str = "",
+    ) -> AssessmentDraftItemContract:
+        c_key = options[correct_option_index] if 0 <= correct_option_index < len(options) else ""
+        return AssessmentDraftItemContract(
             id=str(uuid.uuid4()),
             module_id=module_id,
             question=question,
             options=tuple(options),
             correct_option_index=correct_option_index,
+            correct_key=c_key,
+            rationale=rationale or f"Derived from citation source {citation_source}",
             citation_chunk_id=citation_chunk_id,
             citation_source=citation_source,
             validation_passed=False,
@@ -99,8 +136,52 @@ class AssessmentItem:
         )
 
 
-# --- Run / step tracking (FR-9-adjacent: "every run inspectable step-by-step
-# by run ID", per FR-5) -------------------------------------------------------
+# Backwards compatibility alias
+AssessmentItem = AssessmentDraftItemContract
+
+
+class AssessmentDraftContract(BaseModel):
+    module_id: str
+    items: list[AssessmentDraftItemContract] = Field(default_factory=list)
+
+
+# --- Approval Audit Record --------------------------------------------------
+
+class ApprovalAudit(BaseModel):
+    id: str
+    run_id: str
+    item_id: Optional[str] = None
+    reviewer_id: str
+    decision: str  # approve | reject | edit-and-approve
+    feedback: Optional[str] = None
+    original_draft: str
+    modified_content: Optional[str] = None
+    timestamp: datetime = Field(default_factory=_now)
+
+    @staticmethod
+    def new(
+        run_id: str,
+        reviewer_id: str,
+        decision: str,
+        original_draft: str,
+        item_id: Optional[str] = None,
+        feedback: Optional[str] = None,
+        modified_content: Optional[str] = None,
+    ) -> ApprovalAudit:
+        return ApprovalAudit(
+            id=str(uuid.uuid4()),
+            run_id=run_id,
+            item_id=item_id,
+            reviewer_id=reviewer_id,
+            decision=decision,
+            feedback=feedback,
+            original_draft=original_draft,
+            modified_content=modified_content,
+            timestamp=_now(),
+        )
+
+
+# --- Run / step tracking -----------------------------------------------------
 
 class StepStatus(str, Enum):
     SUCCEEDED = "succeeded"
@@ -108,8 +189,7 @@ class StepStatus(str, Enum):
     DEGRADED = "degraded"  # graceful degradation to plain RAG was invoked
 
 
-@dataclass
-class RunStep:
+class RunStep(BaseModel):
     id: str
     run_id: str
     agent_name: str
@@ -118,7 +198,7 @@ class RunStep:
     input_summary: str
     output_summary: str
     attempt: int = 1
-    started_at: datetime = field(default_factory=_now)
+    started_at: datetime = Field(default_factory=_now)
     error: Optional[str] = None
 
     @staticmethod
@@ -131,7 +211,7 @@ class RunStep:
         output_summary: str,
         attempt: int = 1,
         error: Optional[str] = None,
-    ) -> "RunStep":
+    ) -> RunStep:
         return RunStep(
             id=str(uuid.uuid4()),
             run_id=run_id,
@@ -147,38 +227,32 @@ class RunStep:
 
 class RunStatus(str, Enum):
     RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
     SUCCEEDED = "succeeded"
+    REJECTED = "rejected"
     FAILED = "failed"
     DEGRADED = "degraded"
-    CANCELLED = "cancelled"  # FR-6: client cancellation, distinct from a failure — never degrades to plain RAG
+    CANCELLED = "cancelled"
 
 
-@dataclass
-class Run:
+class Run(BaseModel):
     id: str
     target_role: str
     status: RunStatus = RunStatus.RUNNING
-    started_at: datetime = field(default_factory=_now)
+    started_at: datetime = Field(default_factory=_now)
     finished_at: Optional[datetime] = None
 
     @staticmethod
-    def new(target_role: str) -> "Run":
+    def new(target_role: str) -> Run:
         return Run(id=str(uuid.uuid4()), target_role=target_role)
 
 
-# --- FR-6: real-time progress events -----------------------------------------
+# --- Progress events ---
 
-@dataclass(frozen=True)
-class ProgressEvent:
-    """Emitted by Supervisor.run_streaming() as the pipeline executes —
-    what a client subscribes to over SSE/WebSocket to get live progress
-    instead of a frozen spinner. Deliberately a flat, small, JSON-
-    serializable shape (no Chunk/Answer objects embedded) since this is
-    what crosses the process boundary to a client."""
-
+class ProgressEvent(BaseModel):
     run_id: str
-    event_type: str  # run_started | step_started | step_failed | step_retrying | step_succeeded | run_cancelled | degraded | run_finished
+    event_type: str  # run_started | step_started | step_failed | step_retrying | step_succeeded | waiting_approval | run_cancelled | degraded | run_finished
     step_index: Optional[int]
     agent_name: Optional[str]
     message: str
-    timestamp: datetime = field(default_factory=_now)
+    timestamp: datetime = Field(default_factory=_now)

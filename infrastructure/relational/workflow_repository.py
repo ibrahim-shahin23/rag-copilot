@@ -7,10 +7,12 @@ different tables) rather than a second database.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from domain.workflow_entities import (
+    ApprovalAudit,
     AssessmentItem,
     ItemApprovalStatus,
     Run,
@@ -58,6 +60,19 @@ CREATE TABLE IF NOT EXISTS assessment_items (
     decided_by TEXT,
     decided_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS approval_audits (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    item_id TEXT,
+    reviewer_id TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    feedback TEXT,
+    original_draft TEXT NOT NULL,
+    modified_content TEXT,
+    timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_audits_run_id ON approval_audits(run_id);
 """
 
 
@@ -92,7 +107,6 @@ class SqliteWorkflowRepository(RunRepository, ApprovalGateRepository):
         ).fetchone()
         if row is None:
             return None
-        from datetime import datetime
         return Run(
             id=row[0], target_role=row[1], status=RunStatus(row[2]),
             started_at=datetime.fromisoformat(row[3]),
@@ -122,7 +136,6 @@ class SqliteWorkflowRepository(RunRepository, ApprovalGateRepository):
             "WHERE run_id = ? ORDER BY step_index, attempt",
             (run_id,),
         ).fetchall()
-        from datetime import datetime
         return [
             RunStep(
                 id=r[0], run_id=r[1], agent_name=r[2], step_index=r[3],
@@ -145,7 +158,11 @@ class SqliteWorkflowRepository(RunRepository, ApprovalGateRepository):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 validation_passed=excluded.validation_passed,
-                validation_notes=excluded.validation_notes
+                validation_notes=excluded.validation_notes,
+                approval_status=excluded.approval_status,
+                approved_text=excluded.approved_text,
+                decided_by=excluded.decided_by,
+                decided_at=excluded.decided_at
             """,
             (
                 item.id, item.module_id, item.question, json.dumps(list(item.options)),
@@ -159,7 +176,6 @@ class SqliteWorkflowRepository(RunRepository, ApprovalGateRepository):
 
     def _row_to_item(self, row) -> AssessmentItem:
         import json
-        from datetime import datetime
         return AssessmentItem(
             id=row[0], module_id=row[1], question=row[2],
             options=tuple(json.loads(row[3])), correct_option_index=row[4],
@@ -225,3 +241,33 @@ class SqliteWorkflowRepository(RunRepository, ApprovalGateRepository):
         )
         self._conn.commit()
         return item
+
+    def save_audit(self, audit: ApprovalAudit) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO approval_audits
+            (id, run_id, item_id, reviewer_id, decision, feedback, original_draft, modified_content, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                audit.id, audit.run_id, audit.item_id, audit.reviewer_id,
+                audit.decision, audit.feedback, audit.original_draft,
+                audit.modified_content, audit.timestamp.isoformat(),
+            ),
+        )
+        self._conn.commit()
+
+    def get_audits(self, run_id: str) -> list[ApprovalAudit]:
+        rows = self._conn.execute(
+            "SELECT id, run_id, item_id, reviewer_id, decision, feedback, original_draft, "
+            "modified_content, timestamp FROM approval_audits WHERE run_id = ? ORDER BY timestamp",
+            (run_id,),
+        ).fetchall()
+        return [
+            ApprovalAudit(
+                id=r[0], run_id=r[1], item_id=r[2], reviewer_id=r[3],
+                decision=r[4], feedback=r[5], original_draft=r[6],
+                modified_content=r[7], timestamp=datetime.fromisoformat(r[8]),
+            )
+            for r in rows
+        ]
