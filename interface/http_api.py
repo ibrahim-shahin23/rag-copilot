@@ -37,6 +37,26 @@ from typing import AsyncIterator, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# ---------------------------------------------------------------------------
+# Data-directory resolution — honours DATA_DIR so Vercel's /tmp/data is used
+# instead of the read-only repo `data/` folder.
+# ---------------------------------------------------------------------------
+DEFAULT_DATA_DIR: str = os.getenv("DATA_DIR", "data")
+
+
+def resolve_data_dir(requested: str | None = None) -> str:
+    """Return the writable data directory path.
+
+    If the caller passes one of the legacy sentinel values (``"data"``,
+    ``"./data"``, ``"/data"``, or ``None``) we redirect silently to
+    ``DEFAULT_DATA_DIR``, which is ``/tmp/data`` on Vercel (set by
+    ``api/index.py``) and ``"data"`` everywhere else.  An explicit
+    non-sentinel path (e.g. a test fixture directory) is returned as-is.
+    """
+    if not requested or requested in ("data", "./data", "/data"):
+        return DEFAULT_DATA_DIR
+    return requested
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -210,7 +230,7 @@ class IngestRequest(BaseModel):
     source: str = Field(..., max_length=256)
     doc_type: str = Field(..., max_length=64)
     raw_text: str = Field(..., max_length=5_000_000)
-    data_dir: str = "data"
+    data_dir: str = DEFAULT_DATA_DIR
 
 
 class IngestResponse(BaseModel):
@@ -223,7 +243,7 @@ class IngestResponse(BaseModel):
 
 class AskRequest(BaseModel):
     query: str = Field(..., max_length=10_000)
-    data_dir: str = "data"
+    data_dir: str = DEFAULT_DATA_DIR
 
 
 class CitationResponse(BaseModel):
@@ -243,7 +263,7 @@ class AskResponse(BaseModel):
 class WorkflowRequest(BaseModel):
     target_role: str = Field(..., max_length=128)
     competencies: list[str] = Field(..., max_length=50)
-    data_dir: str = "data"
+    data_dir: str = DEFAULT_DATA_DIR
 
 
 class RunStepResponse(BaseModel):
@@ -285,7 +305,7 @@ class ApprovalItemResponse(BaseModel):
 class ApprovalDecisionRequest(BaseModel):
     decision: str  # "approve" | "reject" | "edit"
     edited_text: Optional[str] = None
-    data_dir: str = "data"
+    data_dir: str = DEFAULT_DATA_DIR
 
 
 class SessionEventResponse(BaseModel):
@@ -309,7 +329,7 @@ def health() -> dict:
 
 @app.post("/ingest", response_model=IngestResponse)
 def ingest(payload: IngestRequest, user: User = Depends(require_role(Role.CONTRIBUTOR))) -> IngestResponse:
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     use_case = IngestDocumentUseCase(
         repo=wiring.repo, embedder=wiring.embedder,
         vector_store=wiring.vector_store, keyword_index=wiring.keyword_index,
@@ -327,7 +347,7 @@ def ingest(payload: IngestRequest, user: User = Depends(require_role(Role.CONTRI
 
 @app.post("/ask", response_model=AskResponse)
 def ask(payload: AskRequest, user: User = Depends(require_role(Role.CONTRIBUTOR))) -> AskResponse:
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     use_case = AnswerQueryUseCase(
         embedder=wiring.embedder, vector_store=wiring.vector_store,
         keyword_index=wiring.keyword_index, llm=wiring.llm,
@@ -351,7 +371,7 @@ def ask(payload: AskRequest, user: User = Depends(require_role(Role.CONTRIBUTOR)
 async def ask_stream(
     payload: AskRequest, request: Request, user: User = Depends(require_role(Role.CONTRIBUTOR)),
 ) -> StreamingResponse:
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     use_case = AnswerQueryUseCase(
         embedder=wiring.embedder, vector_store=wiring.vector_store,
         keyword_index=wiring.keyword_index, llm=wiring.llm,
@@ -398,7 +418,7 @@ async def ask_stream(
 def workflow_run(
     payload: WorkflowRequest, user: User = Depends(require_role(Role.CONTRIBUTOR)),
 ) -> WorkflowRunResponse:
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     supervisor = build_supervisor(wiring)
     run = supervisor.run(payload.target_role, payload.competencies)
     steps = wiring.workflow_repo.get_steps(run.id)
@@ -423,7 +443,7 @@ def workflow_run(
 async def workflow_stream(
     payload: WorkflowRequest, request: Request, user: User = Depends(require_role(Role.CONTRIBUTOR)),
 ) -> StreamingResponse:
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     supervisor = build_supervisor(wiring)
     token = CancellationToken()
 
@@ -481,10 +501,10 @@ def cancel_workflow(run_id: str, user: User = Depends(require_role(Role.CONTRIBU
 
 @app.get("/runs/{run_id}")
 def inspect_run(
-    run_id: str, data_dir: str = "data", user: User = Depends(require_role(Role.REVIEWER, Role.CONTRIBUTOR)),
+    run_id: str, data_dir: str = DEFAULT_DATA_DIR, user: User = Depends(require_role(Role.REVIEWER, Role.CONTRIBUTOR)),
 ) -> dict:
     """Run Inspection endpoint (FR-5): Every execution step audited and queryable via GET /runs/{run_id}."""
-    wiring = build_wiring(data_dir)
+    wiring = build_wiring(resolve_data_dir(data_dir))
     run = wiring.workflow_repo.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"No run found with id {run_id!r}")
@@ -545,19 +565,19 @@ def inspect_run(
 
 class InstructorApproveRequest(BaseModel):
     feedback: Optional[str] = None
-    data_dir: str = "data"
+    data_dir: str = DEFAULT_DATA_DIR
 
 
 class InstructorRejectRequest(BaseModel):
     feedback: str = "Rejected by Lead Instructor"
-    data_dir: str = "data"
+    data_dir: str = DEFAULT_DATA_DIR
 
 
 class InstructorEditApproveRequest(BaseModel):
     edited_items: Optional[list[dict]] = None
     edited_text: Optional[str] = None
     feedback: Optional[str] = None
-    data_dir: str = "data"
+    data_dir: str = DEFAULT_DATA_DIR
 
 
 @app.post("/runs/{run_id}/approve")
@@ -565,7 +585,7 @@ def approve_run(
     run_id: str, payload: InstructorApproveRequest, user: User = Depends(require_role(Role.REVIEWER)),
 ) -> dict:
     """Lead Instructor Approval Gate: Publishes items as proposed."""
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     run = wiring.workflow_repo.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
@@ -601,7 +621,7 @@ def reject_run(
     run_id: str, payload: InstructorRejectRequest, user: User = Depends(require_role(Role.REVIEWER)),
 ) -> dict:
     """Lead Instructor Approval Gate: Rejects items back to draft with instructor feedback."""
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     run = wiring.workflow_repo.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
@@ -636,7 +656,7 @@ def edit_and_approve_run(
     run_id: str, payload: InstructorEditApproveRequest, user: User = Depends(require_role(Role.REVIEWER)),
 ) -> dict:
     """Lead Instructor Approval Gate: Allows Lead Instructor to fix questions, distractors, or keys before final commit."""
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     run = wiring.workflow_repo.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
@@ -681,9 +701,9 @@ def edit_and_approve_run(
 
 @app.get("/workflow/trace/{run_id}", response_model=TraceResponse)
 def workflow_trace(
-    run_id: str, data_dir: str = "data", user: User = Depends(require_role(Role.REVIEWER)),
+    run_id: str, data_dir: str = DEFAULT_DATA_DIR, user: User = Depends(require_role(Role.REVIEWER)),
 ) -> TraceResponse:
-    wiring = build_wiring(data_dir)
+    wiring = build_wiring(resolve_data_dir(data_dir))
     run = wiring.workflow_repo.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"No run with id {run_id!r}")
@@ -710,9 +730,9 @@ def workflow_trace(
 
 @app.get("/approvals", response_model=list[ApprovalItemResponse])
 def list_approvals(
-    data_dir: str = "data", user: User = Depends(require_role(Role.REVIEWER)),
+    data_dir: str = DEFAULT_DATA_DIR, user: User = Depends(require_role(Role.REVIEWER)),
 ) -> list[ApprovalItemResponse]:
-    wiring = build_wiring(data_dir)
+    wiring = build_wiring(resolve_data_dir(data_dir))
     items = wiring.workflow_repo.list_pending()
     response = [
         ApprovalItemResponse(
@@ -741,7 +761,7 @@ def decide_approval(
     if payload.decision == "edit" and not payload.edited_text:
         raise HTTPException(status_code=400, detail="edited_text is required for an 'edit' decision")
 
-    wiring = build_wiring(payload.data_dir)
+    wiring = build_wiring(resolve_data_dir(payload.data_dir))
     try:
         item = wiring.workflow_repo.decide(
             item_id=item_id, decision=decision_map[payload.decision],
@@ -771,8 +791,8 @@ def decide_approval(
 # --- Session history -------------------------------------------------------
 
 @app.get("/sessions", response_model=list[SessionEventResponse])
-def list_sessions(data_dir: str = "data", user: User = Depends(get_current_user)) -> list[SessionEventResponse]:
-    wiring = build_wiring(data_dir)
+def list_sessions(data_dir: str = DEFAULT_DATA_DIR, user: User = Depends(get_current_user)) -> list[SessionEventResponse]:
+    wiring = build_wiring(resolve_data_dir(data_dir))
     username_filter = None if user.role == Role.REVIEWER else user.username
     events = wiring.session_repo.list_events(username=username_filter)
     return [
