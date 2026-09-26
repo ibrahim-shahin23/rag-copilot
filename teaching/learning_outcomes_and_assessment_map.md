@@ -1,16 +1,18 @@
 # Learning Outcomes and Assessment Map
 
-**Course Level:** Post-Graduate (M.Sc. Advanced AI Systems / Applied AI Engineering)  
-**Session Title:** Multi-Agent Orchestration & Human-in-the-Loop Safety in Production  
+**Domain Focus:** Education — Curriculum & Assessment Design Copilot  
+**Course Level:** Post-Graduate (M.Sc. Advanced Software & AI Systems)  
+**Session Title:** Deterministic Multi-Agent State Machines, Safety Gates, & Clean Architecture  
 **Duration:** 90 Minutes  
 
 ---
 
 ## 1. Pedagogical Alignment
 
-| # | Topic Area | Bloom's Taxonomy Level | Measurable Learning Outcome (LO) | Formative Checkpoint (Lab Exercise) | Summative Assessment Criteria |
+| # | Topic Area | Bloom's Level | Measurable Learning Outcome (LO) | Formative Checkpoint (Lab Exercise) | Summative Assessment Criteria |
 |---|---|---|---|---|---|
-| **LO-1** | **Typed Agent Contracts** | Analyze (Level 4) | Deconstruct unstructured agent text communication and formulate strict, typed Pydantic contracts between specialized roles. | Exercise 1: Inspect request/response schemas in `contracts.py` during execution. | Produces valid schema definitions that catch and reject malformed tool inputs at compile/runtime. |
-| **LO-2** | **Supervisor State Machines** | Evaluate (Level 5) | Evaluate failure modes in autonomous loops (recursion, race conditions, drift) and implement a bounded supervisor state machine. | Exercise 4: Intentionally trigger the `MAX_ITERATIONS` breaker. | Designs a state machine preventing infinite delegation cycles while retaining complete execution context. |
-| **LO-3** | **Approval Gates & Side-Effects** | Create (Level 6) | Architect an asynchronous approval gate that intercepts side-effecting operations (`publish_assessment_bank`) before execution. | Exercise 2 & 3: Intercept `waiting_approval` state and execute an `edit-and-approve` mutation. | Implements a persistent, non-blocking gate supporting approve, reject, and edit actions with an immutable audit trail. |
-| **LO-4** | **Automated Validation & Fallbacks** | Apply (Level 3) | Implement programmatic verification passes (distractor plausibility checks) and configure graceful degradation to plain RAG. | Exercise 4 & Stretch Challenge 1: Trigger automated distractor evaluation and fallback pathways. | Writes resilient handlers that degrade to cached baseline syllabi upon agent timeout or unrecoverable error. |
+| **LO-1** | **Clean Architecture & Domain Ports** | Analyze (Level 4) | Critique coupling between agent pipelines and external SDKs; enforce the Clean Architecture dependency rule where `domain/` and `application/` have zero imports from `infrastructure/` or web frameworks. | Exercise 1: Run architectural linter/grep against `domain/` and `application/` to verify zero framework imports. | Explains why domain entities (`workflow_entities.py`) must remain decoupled from specific LLM, vector store, and HTTP drivers. |
+| **LO-2** | **Deterministic Agent Boundaries** | Evaluate (Level 5) | Evaluate failure modes in autonomous loops; construct specialized agents with restricted tool sets, typed Pydantic contracts, and explicit structural termination criteria. | Exercise 2: Run workflow via CLI/API and inspect the step boundary contract transitions (`CompetencyGapReport` → `ModuleOutline` → `AssessmentItem`). | Analyzes why `StandardsMapper` must terminate over a fixed competency list rather than relying on unstructured LLM stopping conditions. |
+| **LO-3** | **Automated Validation vs. LLM-as-Judge** | Apply (Level 3) | Contrast fast, deterministic, offline-testable verification with non-deterministic LLM-as-judge passes to catch plausible-but-wrong assessment items. | Exercise 3: Inspect `application/validation.py` catching non-verbatim keys or unresolved chunk IDs. | Formulates deterministic rules verifying verbatim key occurrences inside canonically re-fetched chunks (`DocumentRepository.find_chunk_by_id`). |
+| **LO-4** | **Human-in-the-Loop & Role Segregation** | Create (Level 6) | Architect a persistent approval gate with strict role segregation, preventing `CONTRIBUTOR` roles from approving items and enforcing `REVIEWER` authentication. | Exercise 4: Attempt cross-role approval (`CONTRIBUTOR` key getting 403 on `/approvals/{id}/decide`). | Implements the triad of decisions (`approve`, `reject`, `edit`) where `decided_by` is derived strictly from server-authenticated context. |
+| **LO-5** | **Supervised Resilience & Cancellation** | Evaluate (Level 5) | Implement runtime controls (max-iteration breakers, per-step timeouts with unblocking thread pools, backoff, and SSE cancellation tokens) that degrade gracefully to plain RAG. | Exercise 5 & Stretch Challenges: Disconnect during `/workflow/stream` or induce step timeouts to observe fallback handling. | Solves the thread pool `__exit__` blocking bug and verifies graceful degradation to `ExtractiveFallbackProvider`. |
